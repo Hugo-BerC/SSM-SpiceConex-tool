@@ -1,15 +1,14 @@
-# AWSPWRCN
+# SSM-PowerConnect
 
 ## Overview
-AWSPWRCN is a Python tool designed to collect AWS compliance and inventory data across multiple accounts using AWS SSO or role-based access.
-It was originally built to run inside WSL (Debian on Windows) but works on any Linux or macOS environment with Python installed.
+SSM-PowerConnect is a Tkinter GUI for AWS SSM operations. It lets you list EC2 instances, open SSM sessions, create port-forwarding tunnels, run commands, and analyze EBS performance/CSV data from a single interface.
 
 ## Features
-- Multi-account inventory collection
-- AWS SSM compliance extraction
-- CSV output generation
-- Modular collector architecture
-- Logging system included
+- Instance discovery by AWS profile
+- SSM session connect
+- SSM port forwarding
+- Multi-instance command execution
+- EBS dashboard generation and CSV analysis
 
 ## Requirements
 - Python 3.9+
@@ -18,20 +17,18 @@ It was originally built to run inside WSL (Debian on Windows) but works on any L
 
 ## Installation
 git clone git@github.com:Hugo-BerC/SSM-PowerConnect.git
-cd SSM-POWERCONNECT
+cd SSM-PowerConnect
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r Windows/requirements.txt
 
 ## AWS Configuration
 aws configure sso
 aws sso login --profile <your-profile>
 
 ## Usage
-python main.py
+- Windows: python Windows/AWSPWRCNv4.1.py
+- macOS: python3 MacOs/AWSPWRCNv4.1.py
 
-## Contributing
-1. Fork the repository
-2. Create a branch
-3. Push changes
-4. Open a Pull Request
+## Notes
+- The UI background image is `skin.jpg`. The macOS script searches in `MacOs/skin.jpg` and `Windows/skin.jpg`.
