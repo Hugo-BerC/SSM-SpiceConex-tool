@@ -107,6 +107,54 @@ def get_profile_account_id(profile):
     return profile_account_ids.get(profile)
 
 
+def fetch_account_id_for_profile(profile):
+    output = run_command(f"aws sts get-caller-identity --profile {profile}")
+    if not output:
+        return None
+    try:
+        return json.loads(output).get("Account")
+    except json.JSONDecodeError:
+        return None
+
+
+def sync_account_ids():
+    config_path = os.path.expanduser("~/.aws/config")
+    parser = configparser.ConfigParser()
+    if os.path.isfile(config_path):
+        parser.read(config_path)
+
+    updated = 0
+    for profile in profiles:
+        if get_profile_account_id(profile):
+            continue
+
+        account_id = fetch_account_id_for_profile(profile)
+        if not account_id:
+            continue
+
+        if profile == "default":
+            section = "default"
+        else:
+            section = f"profile {profile}"
+
+        if not parser.has_section(section):
+            parser.add_section(section)
+
+        parser.set(section, "sso_account_id", account_id)
+        profile_account_ids[profile] = account_id
+        updated += 1
+
+    if updated:
+        with open(config_path, "w") as config_file:
+            parser.write(config_file)
+
+    messagebox.showinfo("Sync Account IDs", f"Updated {updated} profile(s).")
+
+
+def sync_account_ids_async():
+    threading.Thread(target=sync_account_ids).start()
+
+
 def validate_session(profile):
     return run_command(f"aws sts get-caller-identity --profile {profile}") is not None
 
@@ -652,6 +700,9 @@ def main():
 
     refresh_button = ttk.Button(profile_frame, text="Refresh Instances", command=refresh_instances, style="Action.TButton")
     refresh_button.grid(row=0, column=3, padx=5, sticky="e")
+
+    sync_button = ttk.Button(profile_frame, text="Sync Account IDs", command=sync_account_ids_async, style="Action.TButton")
+    sync_button.grid(row=0, column=4, padx=5, sticky="e")
 
     profiles = get_profiles()
     if profiles:
