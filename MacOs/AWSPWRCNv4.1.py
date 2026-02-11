@@ -12,6 +12,7 @@ from PIL import Image, ImageTk
 from tkinter import filedialog
 import numpy as np
 import pandas as pd
+import configparser
 
 
 def log_error(message):
@@ -82,6 +83,30 @@ def get_profiles():
     return sorted(profiles)
 
 
+def load_profile_account_ids():
+    config_path = os.path.expanduser("~/.aws/config")
+    parser = configparser.ConfigParser()
+    if not os.path.isfile(config_path):
+        return {}
+    parser.read(config_path)
+    account_ids = {}
+    for section in parser.sections():
+        if section == "default":
+            profile_name = "default"
+        elif section.startswith("profile "):
+            profile_name = section.replace("profile ", "", 1)
+        else:
+            profile_name = section
+        account_id = parser.get(section, "sso_account_id", fallback=None)
+        if account_id:
+            account_ids[profile_name] = account_id
+    return account_ids
+
+
+def get_profile_account_id(profile):
+    return profile_account_ids.get(profile)
+
+
 def validate_session(profile):
     return run_command(f"aws sts get-caller-identity --profile {profile}") is not None
 
@@ -122,7 +147,16 @@ def get_instances(profile):
 
 def filter_profiles(event):
     search_text = profile_search_entry.get().lower()
-    filtered_profiles = [profile for profile in profiles if search_text in profile.lower()]
+    filtered_profiles = []
+    check_account_id = search_text.isdigit() and len(search_text) >= 4
+    for profile in profiles:
+        if search_text in profile.lower():
+            filtered_profiles.append(profile)
+            continue
+        if check_account_id:
+            account_id = get_profile_account_id(profile)
+            if account_id and search_text in account_id:
+                filtered_profiles.append(profile)
     profile_menu['values'] = filtered_profiles
 
     if filtered_profiles:
@@ -182,6 +216,13 @@ def connect_selected_instances():
     profile = selected_profile.get()
     selected_items = tree.selection()
     instance_ids = [tree.item(item)['values'][1] for item in selected_items]
+    if not instance_ids:
+        typed_id = instance_search_entry.get().strip()
+        if typed_id.startswith("i-"):
+            instance_ids = [typed_id]
+        else:
+            messagebox.showerror("Wake Up!!!", "Select an instance or type a valid Instance ID (i-...).")
+            return
     threading.Thread(target=connect_to_instance, args=(profile, instance_ids)).start()
 
 
@@ -193,7 +234,8 @@ def connect_to_instance(profile, instance_ids):
             return
 
         for instance_id in instance_ids:
-            command = f"aws ssm start-session --target {instance_id} --profile {profile}"
+            aws_path = get_aws_cli_path() or "aws"
+            command = f"{aws_path} ssm start-session --target {instance_id} --profile {profile}"
             open_terminal_command(command)
 
     except Exception as e:
@@ -223,8 +265,9 @@ def open_tunnel_with_terminal():
             messagebox.showerror("Wake Up!!!", " Type LocalPort and RemotePort.")
             return
 
+        aws_path = get_aws_cli_path() or "aws"
         command = (
-            "aws ssm start-session --target "
+            f"{aws_path} ssm start-session --target "
             f"{instance_id} --profile {profile} "
             "--document-name AWS-StartPortForwardingSession "
             f"--parameters portNumber={remoteport},localPortNumber={localport}"
@@ -560,6 +603,7 @@ def ebs_analysis():
 
 def main():
     global profile_search_entry, profile_menu, instance_search_entry, tree, profiles, instances, selected_profile
+    global profile_account_ids
     global localport_entry, remoteport_entry, command_input, command_output, analysis_output
 
     root = tk.Tk()
@@ -581,6 +625,7 @@ def main():
     style.map("Action.TButton", background=[("active", "#222222")], foreground=[("active", "yellow")])
 
     selected_profile = tk.StringVar()
+    profile_account_ids = load_profile_account_ids()
 
     notebook = ttk.Notebook(root, style="TNotebook")
     notebook.pack(expand=True, fill="both")
