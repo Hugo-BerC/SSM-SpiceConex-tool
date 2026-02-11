@@ -8,6 +8,13 @@ APP_NAME="SSM-PowerConnect"
 ENTRY_POINT="MacOs/AWSPWRCNv4.1.py"
 ICON_PNG="icon_converted.png"
 ICON_ICNS="build/${APP_NAME}.icns"
+DMG_PATH="MacOs/${APP_NAME}.dmg"
+TMP_DIR="$(mktemp -d)"
+
+cleanup() {
+  rm -rf "$TMP_DIR" build dist "$ICON_ICNS"
+}
+trap cleanup EXIT
 
 if [[ -f "$ICON_PNG" ]]; then
   ICONSET_DIR="build/icon.iconset"
@@ -39,13 +46,14 @@ fi
   --name "$APP_NAME" \
   --add-data "MacOs/skin.jpg:." \
   "${PYINSTALLER_ICON_ARGS[@]}" \
+  --distpath "$TMP_DIR/dist" \
+  --workpath "$TMP_DIR/build" \
+  --specpath "$TMP_DIR/spec" \
   "$ENTRY_POINT"
-
-DMG_PATH="dist/${APP_NAME}.dmg"
 
 hdiutil create \
   -volname "$APP_NAME" \
-  -srcfolder "dist/${APP_NAME}.app" \
+  -srcfolder "$TMP_DIR/dist/${APP_NAME}.app" \
   -ov \
   -format UDZO \
   "$DMG_PATH"
@@ -58,5 +66,4 @@ if [[ -f "$ICON_ICNS" ]] && command -v SetFile >/dev/null 2>&1; then
   hdiutil detach "$DMG_MOUNT_DIR" -quiet
 fi
 
-echo "Build complete: dist/${APP_NAME}.app"
 echo "DMG created: ${DMG_PATH}"
