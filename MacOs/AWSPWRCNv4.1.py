@@ -5,6 +5,8 @@ import threading
 import json
 import time
 import os
+import sys
+import shutil
 import boto3
 from PIL import Image, ImageTk
 from tkinter import filedialog
@@ -16,14 +18,31 @@ def log_error(message):
     print(f"ERROR: {message}")
 
 
+def get_aws_cli_path():
+    aws_path = shutil.which("aws")
+    if aws_path:
+        return aws_path
+    for path in ("/opt/homebrew/bin/aws", "/usr/local/bin/aws", "/usr/bin/aws"):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def run_command(command):
     try:
+        if command.strip().startswith("aws "):
+            aws_path = get_aws_cli_path()
+            if not aws_path:
+                log_error("AWS CLI not found in PATH.")
+                messagebox.showerror("Wake Up!!!", "AWS CLI not found. Install AWS CLI v2 or ensure it is in PATH.")
+                return ""
+            command = command.replace("aws", aws_path, 1)
         print(f"Ejecutando comando: {command}")
         result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         log_error(f"Error ejecutando {command}: {e.stderr}")
-        return None
+        return ""
 
 
 def open_terminal_command(command):
@@ -42,10 +61,13 @@ def open_terminal_command(command):
 
 def get_skin_path():
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    bundle_dir = getattr(sys, "_MEIPASS", None)
     candidates = [
         os.path.join(script_dir, "skin.jpg"),
         os.path.join(script_dir, "..", "Windows", "skin.jpg"),
     ]
+    if bundle_dir:
+        candidates.insert(0, os.path.join(bundle_dir, "skin.jpg"))
     for path in candidates:
         if os.path.isfile(path):
             return path
@@ -53,7 +75,10 @@ def get_skin_path():
 
 
 def get_profiles():
-    profiles = run_command("aws configure list-profiles").splitlines()
+    output = run_command("aws configure list-profiles")
+    if not output:
+        return []
+    profiles = output.splitlines()
     return sorted(profiles)
 
 
@@ -62,8 +87,8 @@ def validate_session(profile):
 
 
 def login_sso(profile):
-    open_terminal_command(f"aws sso login --profile {profile}")
-    return run_command(f"aws sso login --profile {profile}")
+    aws_path = get_aws_cli_path() or "aws"
+    open_terminal_command(f"{aws_path} sso login --profile {profile}")
 
 
 def get_instances(profile):
@@ -551,7 +576,9 @@ def main():
     style.configure("TEntry", font=("Consolas", 12), background="black", foreground="white")
     style.configure("TNotebook", background="#2E2E2E", borderwidth=0)
     style.configure("TNotebook.Tab", font=("Consolas", 12), background="#2E2E2E", foreground="black")
-    style.configure("TFrame", background="#black")
+    style.configure("TFrame", background="black")
+    style.configure("Action.TButton", background="black", foreground="yellow")
+    style.map("Action.TButton", background=[("active", "#222222")], foreground=[("active", "yellow")])
 
     selected_profile = tk.StringVar()
 
@@ -565,20 +592,20 @@ def main():
     powercommand_frame = create_tab_with_background(notebook, "PowerCommand", skin_path)
     powerebs_frame = create_tab_with_background(notebook, "PowerEBS", skin_path)
 
-    profile_frame = ttk.Frame(powercon_frame, style="TFrame", padding=5)
+    profile_frame = tk.Frame(powercon_frame, bg="black", padx=5, pady=5)
     profile_frame.place(x=20, y=20, relwidth=0.95)
 
     profile_menu_label = tk.Label(profile_frame, text="Search profile: ", font=("Consolas", 12), bg="black", fg="yellow")
     profile_menu_label.grid(row=0, column=0, padx=5, sticky="w")
 
-    profile_search_entry = tk.Entry(profile_frame, font=("Consolas", 12), width=30, bg="#2E2E2E", fg="#258EFE")
+    profile_search_entry = tk.Entry(profile_frame, font=("Consolas", 12), width=30, bg="white", fg="black", insertbackground="black")
     profile_search_entry.grid(row=0, column=1, padx=5, sticky="w")
     profile_search_entry.bind("<KeyRelease>", filter_profiles)
 
     profile_menu = ttk.Combobox(profile_frame, textvariable=selected_profile, font=("Consolas", 12), state="readonly", width=55)
     profile_menu.grid(row=0, column=2, padx=5, sticky="w")
 
-    refresh_button = tk.Button(profile_frame, text="Refresh Instances", command=refresh_instances, font=("Consolas", 12), bg="black", fg="white")
+    refresh_button = ttk.Button(profile_frame, text="Refresh Instances", command=refresh_instances, style="Action.TButton")
     refresh_button.grid(row=0, column=3, padx=5, sticky="e")
 
     profiles = get_profiles()
@@ -588,17 +615,17 @@ def main():
     else:
         messagebox.showerror("Wake Up!!!", "No se encontraron perfiles de AWS configurados.")
 
-    instance_frame = ttk.Frame(powercon_frame, style="TFrame")
+    instance_frame = tk.Frame(powercon_frame, bg="black")
     instance_frame.place(x=20, y=60, relwidth=0.95)
 
     instance_search_label = tk.Label(instance_frame, text="Search instances:", font=("Consolas", 12), bg="black", fg="yellow")
     instance_search_label.grid(row=1, column=0, padx=5, sticky="w")
 
-    instance_search_entry = tk.Entry(instance_frame, font=("Consolas", 12), width=30, bg="#2E2E2E", fg="#258EFE")
+    instance_search_entry = tk.Entry(instance_frame, font=("Consolas", 12), width=30, bg="white", fg="black", insertbackground="black")
     instance_search_entry.grid(row=1, column=1, padx=5, sticky="w")
     instance_search_entry.bind("<KeyRelease>", filter_instances)
 
-    connect_button = tk.Button(instance_frame, text="Connection", command=connect_selected_instances, font=("Consolas", 12), bg="black", fg="white")
+    connect_button = ttk.Button(instance_frame, text="Connection", command=connect_selected_instances, style="Action.TButton")
     connect_button.grid(row=1, column=2, padx=5, sticky="e")
 
     banner_label = tk.Label(instance_frame, text="       * Welcome to AWSPowerConn Tool *              @Mndemnk          ", font=("Consolas", 12), bg="black", fg="yellow")
@@ -614,28 +641,28 @@ def main():
     tree.heading("InstanceState", text="State")
     tree.pack(expand=True, fill="both")
 
-    tk.Label(powertunnel_frame, text="Local Port:", font=("Consolas", 13), bg="#2E2E2E", fg="yellow").pack(pady=7)
-    localport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="#2E2E2E", fg="white")
+    tk.Label(powertunnel_frame, text="Local Port:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=7)
+    localport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
     localport_entry.pack(pady=5)
 
-    tk.Label(powertunnel_frame, text="Remote Port:", font=("Consolas", 13), bg="#2E2E2E", fg="yellow").pack(pady=7)
-    remoteport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="#2E2E2E", fg="white")
+    tk.Label(powertunnel_frame, text="Remote Port:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=7)
+    remoteport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
     remoteport_entry.pack(pady=5)
 
-    tk.Button(powertunnel_frame, text="Start Tunnel", command=open_tunnel_with_terminal, font=("Consolas", 13), bg="#444444", fg="yellow").pack(pady=7)
+    tk.Button(powertunnel_frame, text="Start Tunnel", command=open_tunnel_with_terminal, font=("Consolas", 13), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=7)
 
-    tk.Label(powercommand_frame, text="Command:", font=("Consolas", 13), bg="#2E2E2E", fg="yellow").pack(pady=6)
+    tk.Label(powercommand_frame, text="Command:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=6)
     command_input = tk.Text(powercommand_frame, height=7, width=145, font=("Consolas", 12), bg="black", fg="white")
     command_input.pack(pady=5)
 
-    tk.Button(powercommand_frame, text="Send command", command=invocation, font=("Consolas", 13), bg="#444444", fg="yellow").pack(pady=6)
+    tk.Button(powercommand_frame, text="Send command", command=invocation, font=("Consolas", 13), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
 
     command_output = tk.Text(powercommand_frame, height=38, width=145, font=("Consolas", 12), bg="black", fg="#258EFE", state="disabled")
     command_output.pack(pady=5)
 
-    tk.Label(powerebs_frame, text="EBS Data Analysis", font=("Consolas", 13), bg="#2E2E2E", fg="yellow").pack(pady=6)
-    tk.Button(powerebs_frame, text="Create Dashboard", command=ebs_analysis, font=("Consolas", 12), bg="#444444", fg="yellow").pack(pady=6)
-    tk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, font=("Consolas", 12), bg="#444444", fg="yellow").pack(pady=6)
+    tk.Label(powerebs_frame, text="EBS Data Analysis", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=6)
+    tk.Button(powerebs_frame, text="Create Dashboard", command=ebs_analysis, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
+    tk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
     analysis_output = tk.Text(powerebs_frame, height=40, width=120, font=("Consolas", 12), bg="black", fg="white", insertbackground="white")
     analysis_output.pack(padx=20, pady=10)
 
