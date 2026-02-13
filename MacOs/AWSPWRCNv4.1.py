@@ -745,20 +745,20 @@ def main():
     remoteport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
     remoteport_entry.pack(pady=5)
 
-    tk.Button(powertunnel_frame, text="Start Tunnel", command=open_tunnel_with_terminal, font=("Consolas", 13), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=7)
+    ttk.Button(powertunnel_frame, text="Start Tunnel", command=open_tunnel_with_terminal, style="Action.TButton").pack(pady=7)
 
     tk.Label(powercommand_frame, text="Command:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=6)
     command_input = tk.Text(powercommand_frame, height=7, width=145, font=("Consolas", 12), bg="black", fg="white")
     command_input.pack(pady=5)
 
-    tk.Button(powercommand_frame, text="Send command", command=invocation, font=("Consolas", 13), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
+    ttk.Button(powercommand_frame, text="Send command", command=invocation, style="Action.TButton").pack(pady=6)
 
     command_output = tk.Text(powercommand_frame, height=38, width=145, font=("Consolas", 12), bg="black", fg="#258EFE", state="disabled")
     command_output.pack(pady=5)
 
     tk.Label(powerebs_frame, text="EBS Data Analysis", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=6)
-    tk.Button(powerebs_frame, text="Create Dashboard", command=ebs_analysis, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
-    tk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
+    ttk.Button(powerebs_frame, text="Create Dashboard", command=ebs_analysis, style="Action.TButton").pack(pady=6)
+    ttk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, style="Action.TButton").pack(pady=6)
     analysis_output = tk.Text(powerebs_frame, height=40, width=120, font=("Consolas", 12), bg="black", fg="white", insertbackground="white")
     analysis_output.pack(padx=20, pady=10)
 
