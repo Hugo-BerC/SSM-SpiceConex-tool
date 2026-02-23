@@ -47,14 +47,23 @@ def run_command(command):
 
 
 def open_terminal_command(command):
+    # Escape double quotes in the command for AppleScript
+    escaped_command = command.replace('"', '\\"')
+    
     script = (
         "tell application \"Terminal\"\n"
-        "    if (count of windows) is 0 then\n"
-        f"        do script \"{command}\"\n"
-        "    else\n"
-        f"        do script \"{command}\" in front window\n"
-        "    end if\n"
         "    activate\n"
+        "    if (count of windows) is 0 then\n"
+        f"        do script \"{escaped_command}\"\n"
+        "    else\n"
+        "        tell application \"System Events\"\n"
+        "            tell process \"Terminal\"\n"
+        "                keystroke \"t\" using command down\n"
+        "            end tell\n"
+        "        end tell\n"
+        "        delay 0.3\n"
+        f"        do script \"{escaped_command}\" in front window\n"
+        "    end if\n"
         "end tell"
     )
     subprocess.run(["osascript", "-e", script], check=False)
