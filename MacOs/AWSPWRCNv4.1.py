@@ -706,6 +706,7 @@ def main():
 
     profile_menu = ttk.Combobox(profile_frame, textvariable=selected_profile, font=("Consolas", 12), state="readonly", width=55)
     profile_menu.grid(row=0, column=2, padx=5, sticky="w")
+    profile_menu.bind("<<ComboboxSelected>>", lambda event: threading.Thread(target=refresh_instances).start())
 
     refresh_button = ttk.Button(profile_frame, text="Refresh Instances", command=refresh_instances, style="Action.TButton")
     refresh_button.grid(row=0, column=3, padx=5, sticky="e")
@@ -745,6 +746,7 @@ def main():
     tree.heading("PrivateIP", text="Private IP")
     tree.heading("InstanceState", text="State")
     tree.pack(expand=True, fill="both")
+    tree.bind("<Double-1>", lambda event: connect_selected_instances())
 
     tk.Label(powertunnel_frame, text="Local Port:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=7)
     localport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
