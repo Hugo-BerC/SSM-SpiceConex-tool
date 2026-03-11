@@ -47,17 +47,61 @@ def run_command(command):
 
 
 def open_terminal_command(command):
-    script = (
+    # Escape double quotes and backslashes in the command for AppleScript
+    escaped_command = command.replace('\\', '\\\\').replace('"', '\\"')
+
+    tab_script = (
         "tell application \"Terminal\"\n"
-        "    if (count of windows) is 0 then\n"
-        f"        do script \"{command}\"\n"
-        "    else\n"
-        f"        do script \"{command}\" in front window\n"
-        "    end if\n"
         "    activate\n"
+        "    if (count of windows) is 0 then\n"
+        f"        do script \"{escaped_command}\"\n"
+        "    else\n"
+        "        tell application \"System Events\"\n"
+        "            tell process \"Terminal\"\n"
+        "                keystroke \"t\" using command down\n"
+        "            end tell\n"
+        "        end tell\n"
+        "        delay 0.3\n"
+        f"        do script \"{escaped_command}\" in front window\n"
+        "    end if\n"
         "end tell"
     )
-    subprocess.run(["osascript", "-e", script], check=False)
+
+    window_script = (
+        "tell application \"Terminal\"\n"
+        "    activate\n"
+        f"    do script \"{escaped_command}\"\n"
+        "end tell"
+    )
+
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", tab_script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        log_error(f"Cannot execute osascript: {error}")
+        messagebox.showerror("Wake Up!!!", f"Cannot open Terminal:\n{error}")
+        return
+
+    if result.returncode == 0:
+        return
+
+    log_error(f"Cannot open Terminal tab: {result.stderr.strip()}")
+    fallback = subprocess.run(
+        ["/usr/bin/osascript", "-e", window_script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if fallback.returncode != 0:
+        log_error(f"Cannot open Terminal window: {fallback.stderr.strip()}")
+        messagebox.showerror(
+            "Wake Up!!!",
+            "Cannot open Terminal automatically. Check Automation permissions for Terminal and System Events.",
+        )
 
 
 def get_skin_path():
@@ -697,6 +741,7 @@ def main():
 
     profile_menu = ttk.Combobox(profile_frame, textvariable=selected_profile, font=("Consolas", 12), state="readonly", width=55)
     profile_menu.grid(row=0, column=2, padx=5, sticky="w")
+    profile_menu.bind("<<ComboboxSelected>>", lambda event: threading.Thread(target=refresh_instances).start())
 
     refresh_button = ttk.Button(profile_frame, text="Refresh Instances", command=refresh_instances, style="Action.TButton")
     refresh_button.grid(row=0, column=3, padx=5, sticky="e")
@@ -737,6 +782,23 @@ def main():
     tree.heading("InstanceState", text="State")
     tree.pack(expand=True, fill="both")
 
+    _last_dclick_time = [0]
+
+    def on_double_click(event):
+        now = time.time()
+        if now - _last_dclick_time[0] < 1.0:
+            return "break"
+        _last_dclick_time[0] = now
+        item = tree.identify_row(event.y)
+        if item:
+            tree.selection_set(item)
+            instance_id = tree.item(item)['values'][1]
+            profile = selected_profile.get()
+            threading.Thread(target=connect_to_instance, args=(profile, [instance_id])).start()
+        return "break"
+
+    tree.bind("<Double-1>", on_double_click)
+
     tk.Label(powertunnel_frame, text="Local Port:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=7)
     localport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
     localport_entry.pack(pady=5)
@@ -745,20 +807,20 @@ def main():
     remoteport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
     remoteport_entry.pack(pady=5)
 
-    tk.Button(powertunnel_frame, text="Start Tunnel", command=open_tunnel_with_terminal, font=("Consolas", 13), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=7)
+    ttk.Button(powertunnel_frame, text="Start Tunnel", command=open_tunnel_with_terminal, style="Action.TButton").pack(pady=7)
 
     tk.Label(powercommand_frame, text="Command:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=6)
     command_input = tk.Text(powercommand_frame, height=7, width=145, font=("Consolas", 12), bg="black", fg="white")
     command_input.pack(pady=5)
 
-    tk.Button(powercommand_frame, text="Send command", command=invocation, font=("Consolas", 13), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
+    ttk.Button(powercommand_frame, text="Send command", command=invocation, style="Action.TButton").pack(pady=6)
 
     command_output = tk.Text(powercommand_frame, height=38, width=145, font=("Consolas", 12), bg="black", fg="#258EFE", state="disabled")
     command_output.pack(pady=5)
 
     tk.Label(powerebs_frame, text="EBS Data Analysis", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=6)
-    tk.Button(powerebs_frame, text="Create Dashboard", command=ebs_analysis, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
-    tk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
+    ttk.Button(powerebs_frame, text="Create Dashboard", command=ebs_analysis, style="Action.TButton").pack(pady=6)
+    ttk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, style="Action.TButton").pack(pady=6)
     analysis_output = tk.Text(powerebs_frame, height=40, width=120, font=("Consolas", 12), bg="black", fg="white", insertbackground="white")
     analysis_output.pack(padx=20, pady=10)
 
