@@ -49,8 +49,8 @@ def run_command(command):
 def open_terminal_command(command):
     # Escape double quotes and backslashes in the command for AppleScript
     escaped_command = command.replace('\\', '\\\\').replace('"', '\\"')
-    
-    script = (
+
+    tab_script = (
         "tell application \"Terminal\"\n"
         "    activate\n"
         "    if (count of windows) is 0 then\n"
@@ -66,7 +66,42 @@ def open_terminal_command(command):
         "    end if\n"
         "end tell"
     )
-    subprocess.run(["osascript", "-e", script], check=False)
+
+    window_script = (
+        "tell application \"Terminal\"\n"
+        "    activate\n"
+        f"    do script \"{escaped_command}\"\n"
+        "end tell"
+    )
+
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", tab_script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        log_error(f"Cannot execute osascript: {error}")
+        messagebox.showerror("Wake Up!!!", f"Cannot open Terminal:\n{error}")
+        return
+
+    if result.returncode == 0:
+        return
+
+    log_error(f"Cannot open Terminal tab: {result.stderr.strip()}")
+    fallback = subprocess.run(
+        ["/usr/bin/osascript", "-e", window_script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if fallback.returncode != 0:
+        log_error(f"Cannot open Terminal window: {fallback.stderr.strip()}")
+        messagebox.showerror(
+            "Wake Up!!!",
+            "Cannot open Terminal automatically. Check Automation permissions for Terminal and System Events.",
+        )
 
 
 def get_skin_path():

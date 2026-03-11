@@ -6,12 +6,15 @@ cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
 APP_NAME="SSM-PowerConnect"
+APP_BUNDLE_ID="com.iberia.ssm-powerconnect"
 ENTRY_POINT="MacOs/AWSPWRCNv4.1.py"
 ICON_PNG="icon.png"
 DMG_PATH="MacOs/${APP_NAME}.dmg"
 TMP_DIR="$(mktemp -d)"
 ICON_ICNS="${TMP_DIR}/${APP_NAME}.icns"
 SKIN_PATH="${ROOT_DIR}/MacOs/skin.jpg"
+APP_PATH="${TMP_DIR}/dist/${APP_NAME}.app"
+APP_PLIST="${APP_PATH}/Contents/Info.plist"
 PYINSTALLER_ICON_ARGS=()
 
 cleanup() {
@@ -46,6 +49,7 @@ fi
   --clean \
   --windowed \
   --name "$APP_NAME" \
+  --osx-bundle-identifier "$APP_BUNDLE_ID" \
   "${PYINSTALLER_ICON_ARGS[@]+${PYINSTALLER_ICON_ARGS[@]}}" \
   --distpath "$TMP_DIR/dist" \
   --workpath "$TMP_DIR/build" \
@@ -53,9 +57,17 @@ fi
   --add-data "${SKIN_PATH}:." \
   "$ENTRY_POINT"
 
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_BUNDLE_ID" "$APP_PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$APP_PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1" "$APP_PLIST" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$APP_PLIST"
+/usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string SSM-PowerConnect needs access to Terminal and System Events to open AWS SSM sessions in new Terminal tabs." "$APP_PLIST" 2>/dev/null || \
+  /usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription SSM-PowerConnect needs access to Terminal and System Events to open AWS SSM sessions in new Terminal tabs." "$APP_PLIST"
+codesign --force --deep --sign - "$APP_PATH"
+
 hdiutil create \
   -volname "$APP_NAME" \
-  -srcfolder "$TMP_DIR/dist/${APP_NAME}.app" \
+  -srcfolder "$APP_PATH" \
   -ov \
   -format UDZO \
   "$DMG_PATH"
