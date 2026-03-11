@@ -47,8 +47,8 @@ def run_command(command):
 
 
 def open_terminal_command(command):
-    # Escape double quotes in the command for AppleScript
-    escaped_command = command.replace('"', '\\"')
+    # Escape double quotes and backslashes in the command for AppleScript
+    escaped_command = command.replace('\\', '\\\\').replace('"', '\\"')
     
     script = (
         "tell application \"Terminal\"\n"
@@ -746,7 +746,23 @@ def main():
     tree.heading("PrivateIP", text="Private IP")
     tree.heading("InstanceState", text="State")
     tree.pack(expand=True, fill="both")
-    tree.bind("<Double-1>", lambda event: connect_selected_instances())
+
+    _last_dclick_time = [0]
+
+    def on_double_click(event):
+        now = time.time()
+        if now - _last_dclick_time[0] < 1.0:
+            return "break"
+        _last_dclick_time[0] = now
+        item = tree.identify_row(event.y)
+        if item:
+            tree.selection_set(item)
+            instance_id = tree.item(item)['values'][1]
+            profile = selected_profile.get()
+            threading.Thread(target=connect_to_instance, args=(profile, [instance_id])).start()
+        return "break"
+
+    tree.bind("<Double-1>", on_double_click)
 
     tk.Label(powertunnel_frame, text="Local Port:", font=("Consolas", 13), bg="#1E1E1E", fg="yellow").pack(pady=7)
     localport_entry = tk.Entry(powertunnel_frame, font=("Consolas", 13), bg="white", fg="black", insertbackground="black")
