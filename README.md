@@ -29,6 +29,8 @@ aws sso login --profile <your-profile>
 ## Usage
 - Windows: python Windows/AWSPWRCNv4.1.py
 - macOS: python3 MacOs/AWSPWRCNv4.1.py
+- AmazonSpiceOx: sh AmazonSpiceOx/run.sh
 
 ## Notes
 - The UI background image is `skin.jpg`. The macOS script searches in `MacOs/skin.jpg` and `Windows/skin.jpg`.
+- The AmazonSpiceOx variant is in `AmazonSpiceOx/` and uses Linux GUI tooling (`xterm`/Tkinter) instead of Windows Terminal, WSL Debian or macOS Terminal.
