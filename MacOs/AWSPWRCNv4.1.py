@@ -7,12 +7,17 @@ import time
 import os
 import sys
 import shutil
+import shlex
+import html
 import boto3
 from PIL import Image, ImageTk
 from tkinter import filedialog
 import numpy as np
 import pandas as pd
 import configparser
+
+APP_NAME = "SSM-PowerConnect"
+DEFAULT_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "eu-west-1"
 
 
 def log_error(message):
@@ -23,7 +28,7 @@ def get_aws_cli_path():
     aws_path = shutil.which("aws")
     if aws_path:
         return aws_path
-    for path in ("/opt/homebrew/bin/aws", "/usr/local/bin/aws", "/usr/bin/aws"):
+    for path in ("/opt/homebrew/bin/aws", "/usr/local/bin/aws", "/usr/bin/aws", "/bin/aws"):
         if os.path.isfile(path):
             return path
     return None
@@ -47,17 +52,20 @@ def run_command(command):
 
 
 def open_terminal_command(command):
+    # Terminal.app receives AppleScript source, so quote the shell command for
+    # AppleScript independently from the shell quoting used to build it.
+    apple_script_command = command.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
     script = (
         "tell application \"Terminal\"\n"
         "    if (count of windows) is 0 then\n"
-        f"        do script \"{command}\"\n"
+        f"        do script \"{apple_script_command}\"\n"
         "    else\n"
-        f"        do script \"{command}\" in front window\n"
+        f"        do script \"{apple_script_command}\" in front window\n"
         "    end if\n"
         "    activate\n"
         "end tell"
     )
-    subprocess.run(["osascript", "-e", script], check=False)
+    return subprocess.run(["osascript", "-e", script], check=False).returncode == 0
 
 
 def get_skin_path():
@@ -108,7 +116,7 @@ def get_profile_account_id(profile):
 
 
 def fetch_account_id_for_profile(profile):
-    output = run_command(f"aws sts get-caller-identity --profile {profile}")
+    output = run_command(f"aws sts get-caller-identity --profile {shlex.quote(profile)}")
     if not output:
         return None
     try:
@@ -152,21 +160,21 @@ def sync_account_ids():
 
 
 def sync_account_ids_async():
-    threading.Thread(target=sync_account_ids).start()
+    threading.Thread(target=sync_account_ids, daemon=True).start()
 
 
 def validate_session(profile):
-    return run_command(f"aws sts get-caller-identity --profile {profile}") is not None
+    return bool(run_command(f"aws sts get-caller-identity --profile {shlex.quote(profile)}"))
 
 
 def login_sso(profile):
     aws_path = get_aws_cli_path() or "aws"
-    open_terminal_command(f"{aws_path} sso login --profile {profile}")
+    open_terminal_command(f"{shlex.quote(aws_path)} sso login --profile {shlex.quote(profile)}")
 
 
 def get_instances(profile):
     try:
-        session = boto3.Session(profile_name=profile, region_name="eu-west-1")
+        session = boto3.Session(profile_name=profile, region_name=DEFAULT_REGION)
 
         ec2_client = session.client('ec2')
         response = ec2_client.describe_instances()
@@ -189,8 +197,7 @@ def get_instances(profile):
 
     except Exception as e:
         log_error(f"Error getting instances from profile {profile}")
-        print(e)
-        return e
+        raise RuntimeError(f"Cannot get instances from profile {profile}: {e}") from e
 
 
 def filter_profiles(event):
@@ -235,14 +242,11 @@ def refresh_instances():
 
     try:
         instances = get_instances(profile)
-        if 'ERROR' in instances:
-            messagebox.showerror("Wake Up!!!", "Session outdated or not logged in. Please perform SSO login")
-            login_sso(profile)
-
     except Exception as e:
         messagebox.showerror("Wake Up!!!", "Session outdated or not logged in. Please perform SSO login")
         login_sso(profile)
         print(e)
+        return
 
     if not instances:
         messagebox.showerror("Wake Up!!!", f"Instances not found on: {profile}")
@@ -271,7 +275,7 @@ def connect_selected_instances():
         else:
             messagebox.showerror("Wake Up!!!", "Select an instance or type a valid Instance ID (i-...).")
             return
-    threading.Thread(target=connect_to_instance, args=(profile, instance_ids)).start()
+    threading.Thread(target=connect_to_instance, args=(profile, instance_ids), daemon=True).start()
 
 
 def connect_to_instance(profile, instance_ids):
@@ -283,7 +287,10 @@ def connect_to_instance(profile, instance_ids):
 
         for instance_id in instance_ids:
             aws_path = get_aws_cli_path() or "aws"
-            command = f"{aws_path} ssm start-session --target {instance_id} --profile {profile}"
+            command = (
+                f"{shlex.quote(aws_path)} ssm start-session "
+                f"--target {shlex.quote(instance_id)} --profile {shlex.quote(profile)}"
+            )
             open_terminal_command(command)
 
     except Exception as e:
@@ -295,11 +302,13 @@ def open_tunnel_with_terminal():
     """Abre un tunel en la instancia seleccionada con parametros especificos."""
     try:
         selected_items = tree.selection()
-        if not selected_items:
-            messagebox.showerror("Wake Up!!!", "No instances selected")
-            return
-
-        instance_id = tree.item(selected_items[0])['values'][1]
+        if selected_items:
+            instance_id = tree.item(selected_items[0])['values'][1]
+        else:
+            instance_id = instance_search_entry.get().strip()
+            if not instance_id.startswith("i-"):
+                messagebox.showerror("Wake Up!!!", "Select an instance or type a valid Instance ID (i-...).")
+                return
         profile = selected_profile.get()
 
         if not profile:
@@ -312,13 +321,16 @@ def open_tunnel_with_terminal():
         if not localport or not remoteport:
             messagebox.showerror("Wake Up!!!", " Type LocalPort and RemotePort.")
             return
+        if not localport.isdigit() or not remoteport.isdigit():
+            messagebox.showerror("Wake Up!!!", "LocalPort and RemotePort must be numeric.")
+            return
 
         aws_path = get_aws_cli_path() or "aws"
         command = (
-            f"{aws_path} ssm start-session --target "
-            f"{instance_id} --profile {profile} "
+            f"{shlex.quote(aws_path)} ssm start-session --target "
+            f"{shlex.quote(instance_id)} --profile {shlex.quote(profile)} "
             "--document-name AWS-StartPortForwardingSession "
-            f"--parameters portNumber={remoteport},localPortNumber={localport}"
+            f"--parameters portNumber={shlex.quote(remoteport)},localPortNumber={shlex.quote(localport)}"
         )
 
         open_terminal_command(command)
@@ -339,7 +351,7 @@ def invocation():
         if not command:
             raise ValueError("Debe ingresar un comando para ejecutar.")
 
-        threading.Thread(target=sendcommand, args=(instance_ids, command, selected_profile.get())).start()
+        threading.Thread(target=sendcommand, args=(instance_ids, command, selected_profile.get()), daemon=True).start()
         print(instance_ids)
     except Exception as e:
         messagebox.showerror("Wake Up!!!", str(e))
@@ -368,15 +380,20 @@ def sendcommand(instance_ids, command, profile):
                 CommandId=command_id,
                 InstanceId=instance
             )
-            while invocation_result['Status'] == 'InProgress':
+            while invocation_result['Status'] in ("Pending", "InProgress", "Delayed"):
+                time.sleep(1)
                 invocation_result = ssm_client.get_command_invocation(
                     CommandId=command_id,
                     InstanceId=instance
                 )
             standard_output = invocation_result['StandardOutputContent']
+            standard_error = invocation_result.get('StandardErrorContent', '')
             print(standard_output)
 
-            output.append(f"Instance {instance}:\n{standard_output}\n{'='*120}\n")
+            instance_output = f"Instance {instance}:\n{standard_output}"
+            if standard_error:
+                instance_output += f"\nSTDERR:\n{standard_error}"
+            output.append(f"{instance_output}\n{'='*120}\n")
 
         except Exception as e:
             print(e)
@@ -384,8 +401,129 @@ def sendcommand(instance_ids, command, profile):
 
     command_output.configure(state="normal")
     command_output.delete("1.0", tk.END)
-    command_output.insert(tk.END, output)
+    command_output.insert(tk.END, "\n".join(output))
     command_output.configure(state="disabled")
+
+
+# Connectivity Validation ----------------------------------------------------
+# The checks run on the managed instance through SSM; macOS is only the UI.
+def load_connectivity_csv():
+    path = filedialog.askopenfilename(title="Select connectivity CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+    if not path:
+        return
+    try:
+        dataframe = pd.read_csv(path)
+        fields = {str(column).strip().lower().replace("_", ""): column for column in dataframe.columns}
+        def column(*names):
+            for name in names:
+                if name in fields:
+                    return fields[name]
+            raise ValueError(f"Missing CSV column. Expected one of: {', '.join(names)}")
+        service, destination = column("servicename", "service", "servicio", "name"), column("destination", "destino", "host", "target")
+        port, scope = column("port", "puerto"), column("scope", "tipo", "type")
+        rows = []
+        for index, item in dataframe.iterrows():
+            values = [str(item[field]).strip() for field in (service, destination, port, scope)]
+            if not all(values) or any("|" in value or "\n" in value for value in values):
+                raise ValueError(f"Invalid connectivity row {index + 2}")
+            if not values[2].isdigit() or not 1 <= int(values[2]) <= 65535:
+                raise ValueError(f"Invalid port in row {index + 2}: {values[2]}")
+            rows.append(dict(service=values[0], destination=values[1], port=values[2], scope=values[3].lower()))
+        if not rows:
+            raise ValueError("The CSV contains no validation targets.")
+        globals()["connectivity_rows"] = rows
+        connectivity_csv_var.set(f"{os.path.basename(path)} · {len(rows)} services")
+        for item in connectivity_input_tree.get_children(): connectivity_input_tree.delete(item)
+        for row in rows: connectivity_input_tree.insert("", tk.END, values=(row["service"], row["destination"], row["port"], row["scope"]))
+        connectivity_summary_var.set("CSV loaded. Select one source instance and run validation.")
+    except Exception as exc:
+        messagebox.showerror("Connectivity CSV", str(exc))
+
+
+def connectivity_script(rows, timeout_seconds):
+    targets = "\n".join(f"{row['service']}|{row['destination']}|{row['port']}|{row['scope']}" for row in rows)
+    return f'''set +e
+NC_BIN="$(command -v nc || command -v ncat || true)"
+[ -z "$NC_BIN" ] && printf 'ERROR|nc not found|0|unknown|KO|0|nc command not found|unavailable\\n' && exit 0
+while IFS='|' read -r service destination port scope; do
+  start=$(date +%s%3N 2>/dev/null || date +%s) ; output=$("$NC_BIN" -vz -w {timeout_seconds} "$destination" "$port" 2>&1) ; code=$? ; end=$(date +%s%3N 2>/dev/null || date +%s)
+  duration=$((end-start)); [ "$duration" -lt 100 ] && duration=$((duration*1000))
+  status=KO; detail=$(printf '%s' "$output" | tr '\\r\\n|' '   '); hop=unavailable
+  if [ "$code" -eq 0 ]; then status=OK; detail=connected; hop=connected
+  elif getent ahosts "$destination" >/dev/null 2>&1; then
+    case "$detail" in *timed*out*|*TIMEOUT*) status=TIMEOUT;; *refused*|*Refused*) status=REFUSED;; *unreachable*|*Unreachable*) status=UNREACHABLE;; esac
+  else status=DNS; detail='DNS resolution failed'; hop=dns-unresolved; fi
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' "$service" "$destination" "$port" "$scope" "$status" "$duration" "$detail" "$hop"
+done <<'EOF_CONNECTIVITY'
+{targets}
+EOF_CONNECTIVITY'''
+
+
+def parse_connectivity_output(output):
+    results = []
+    for line in output.splitlines():
+        fields = line.split("|", 7)
+        if len(fields) == 8:
+            results.append(dict(zip(("service", "destination", "port", "scope", "status", "duration", "detail", "last_hop"), fields)))
+    return results
+
+
+def render_connectivity_results(results, source, profile):
+    globals()["connectivity_results"] = results
+    globals()["connectivity_context"] = dict(source=source, profile=profile, region=DEFAULT_REGION)
+    for item in connectivity_results_tree.get_children(): connectivity_results_tree.delete(item)
+    ok = 0
+    for row in results:
+        success = row["status"] == "OK"; ok += success
+        connectivity_results_tree.insert("", tk.END, values=(row["service"], row["destination"], row["port"], row["scope"], row["status"], row["duration"], row["detail"]), tags=("ok" if success else "ko",))
+    connectivity_summary_var.set(f"Validated {len(results)} services · OK {ok} · Failed {len(results)-ok} · {source}")
+
+
+def execute_connectivity_validation(profile, instance_id, source, rows, timeout):
+    try:
+        client = boto3.Session(profile_name=profile, region_name=DEFAULT_REGION).client("ssm")
+        response = client.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript", Parameters={"commands": [connectivity_script(rows, timeout)]}, TimeoutSeconds=max(60, len(rows) * (timeout + 2)))
+        command_id = response["Command"]["CommandId"]
+        while True:
+            time.sleep(1)
+            invocation = client.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+            if invocation["Status"] not in ("Pending", "InProgress", "Delayed"):
+                break
+        results = parse_connectivity_output(invocation.get("StandardOutputContent", ""))
+        if not results: raise RuntimeError(invocation.get("StandardErrorContent") or f"SSM command ended with {invocation['Status']} and no parsable results.")
+        root.after(0, lambda: render_connectivity_results(results, source, profile))
+    except Exception as exc:
+        root.after(0, lambda: messagebox.showerror("Connectivity validation", str(exc)))
+
+
+def run_connectivity_validation():
+    try:
+        rows = globals().get("connectivity_rows", [])
+        selected = tree.selection()
+        if len(selected) != 1: raise ValueError("Select exactly one source instance in PowerCon.")
+        if not rows: raise ValueError("Load a connectivity CSV first.")
+        timeout = int(connectivity_timeout_var.get())
+        if not 1 <= timeout <= 60: raise ValueError("Timeout must be between 1 and 60 seconds.")
+        values = tree.item(selected[0])["values"]; instance_id, source = values[1], values[0]
+        connectivity_summary_var.set(f"Running validation from {source}...")
+        threading.Thread(target=execute_connectivity_validation, args=(selected_profile.get(), instance_id, source, rows, timeout), daemon=True).start()
+    except Exception as exc:
+        messagebox.showerror("Connectivity validation", str(exc))
+
+
+def export_connectivity_report():
+    results = globals().get("connectivity_results", [])
+    if not results:
+        messagebox.showerror("Connectivity export", "Run a connectivity validation first."); return
+    path = filedialog.asksaveasfilename(title="Export connectivity report", defaultextension=".html", initialfile="connectivity-validation-report.html", filetypes=[("HTML files", "*.html")])
+    if not path: return
+    context = globals()["connectivity_context"]
+    ok = sum(row["status"] == "OK" for row in results)
+    table = "".join("<tr class='%s'>%s</tr>" % ("ok" if row["status"] == "OK" else "failed", "".join(f"<td>{html.escape(row[key])}</td>" for key in ("service", "destination", "port", "scope", "status", "duration", "detail"))) for row in results)
+    routes = "".join(f"<div class='route {'ok' if row['status'] == 'OK' else 'failed'}'><strong>{html.escape(row['service'])}</strong><span>{html.escape(row['destination'])}:{html.escape(row['port'])}</span><small>{html.escape(row['status'])} · {html.escape(row['scope'])}</small></div>" for row in results)
+    report = f"""<!doctype html><html><head><meta charset='utf-8'><title>Connectivity validation report</title><style>body{{background:#120d09;color:#f5dfb1;font:14px monospace;margin:32px}}h1,h2,strong{{color:#f6c453}}.card{{display:inline-block;border:1px solid #735738;padding:12px 22px;margin:0 8px 20px 0}}.map{{display:flex;gap:24px;border:1px solid #735738;padding:20px;background:#0b0d10}}.source{{border:2px solid #f6c453;padding:20px;min-width:150px;text-align:center;background:#2a1a0e}}.routes{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;flex:1}}.route{{border-left:4px solid #e53935;padding:10px;background:#1c130c}}.route.ok{{border-color:#4caf50}}.route span,.route small{{display:block;margin-top:4px;color:#d6aa72}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;text-align:left;border-bottom:1px solid #735738}}th{{color:#f6c453}}tr.ok td{{background:#12351a}}tr.failed td{{background:#381619}}</style></head><body><h1>Connectivity validation report</h1><p>Source: {html.escape(context['source'])} · Profile: {html.escape(context['profile'])} · Region: {html.escape(context['region'])}</p><div class='card'>Services<br><strong>{len(results)}</strong></div><div class='card'>OK<br><strong>{ok}</strong></div><div class='card'>Failed<br><strong>{len(results)-ok}</strong></div><h2>Connectivity map</h2><div class='map'><div class='source'><strong>SOURCE</strong><br>{html.escape(context['source'])}</div><div class='routes'>{routes}</div></div><h2>Validation results</h2><table><tr><th>Service</th><th>Destination</th><th>Port</th><th>Scope</th><th>Status</th><th>Duration (ms)</th><th>Detail</th></tr>{table}</table></body></html>"""
+    with open(path, "w", encoding="utf-8") as handle: handle.write(report)
+    messagebox.showinfo("Connectivity export", f"Report exported to:\n{path}")
 
 
 def add_tab_with_background(notebook, text, image_path):
@@ -568,7 +706,8 @@ def ebs_analysis():
         log_error(f"Cannot create dashboard: {e}")
         messagebox.showerror("Wake Up!!!", f"Cannot create dashboard:\n{e}")
 
-    session = boto3.Session(profile_name=profile)
+    region = DEFAULT_REGION
+    session = boto3.Session(profile_name=profile, region_name=region)
     ec2_client = session.client('ec2')
     cloudwatch_client = session.client('cloudwatch')
 
@@ -596,19 +735,19 @@ def ebs_analysis():
             "type": "metric",
             "properties": {
                 "metrics": [
-                    [{"expression": "(m1+m2)/(PERIOD(m1)-m3)", "label": "Average IOPS/s when volume is active", "id": "e1", "region": "eu-west-1"}],
-                    [{"expression": "(m1+m2)/(PERIOD(m1))", "label": "Average IOPS/s", "id": "e2", "visible": False, "region": "eu-west-1"}],
-                    [{"expression": "(m4+m5)/(PERIOD(m4)-m3)", "label": "Average Throughput when volume is active", "id": "e3", "region": "eu-west-1"}],
-                    [{"expression": "(m4+m5)/(PERIOD(m4))", "label": "Average Throughput in bytes", "id": "e4", "visible": False, "region": "eu-west-1"}],
-                    ["AWS/EBS", "VolumeReadOps", "VolumeId", volume["VolumeId"], {"region": "eu-west-1", "id": "m1", "visible": False}],
-                    ["AWS/EBS", "VolumeWriteOps", "VolumeId", volume["VolumeId"], {"region": "eu-west-1", "id": "m2", "visible": False}],
-                    ["AWS/EBS", "VolumeIdleTime", "VolumeId", volume["VolumeId"], {"region": "eu-west-1", "id": "m3", "visible": False}],
-                    ["AWS/EBS", "VolumeReadBytes", "VolumeId", volume["VolumeId"], {"region": "eu-west-1", "id": "m4", "visible": False}],
-                    ["AWS/EBS", "VolumeWriteBytes", "VolumeId", volume["VolumeId"], {"region": "eu-west-1", "id": "m5", "visible": False}]
+                    [{"expression": "(m1+m2)/(PERIOD(m1)-m3)", "label": "Average IOPS/s when volume is active", "id": "e1", "region": region}],
+                    [{"expression": "(m1+m2)/(PERIOD(m1))", "label": "Average IOPS/s", "id": "e2", "visible": False, "region": region}],
+                    [{"expression": "(m4+m5)/(PERIOD(m4)-m3)", "label": "Average Throughput when volume is active", "id": "e3", "region": region}],
+                    [{"expression": "(m4+m5)/(PERIOD(m4))", "label": "Average Throughput in bytes", "id": "e4", "visible": False, "region": region}],
+                    ["AWS/EBS", "VolumeReadOps", "VolumeId", volume["VolumeId"], {"region": region, "id": "m1", "visible": False}],
+                    ["AWS/EBS", "VolumeWriteOps", "VolumeId", volume["VolumeId"], {"region": region, "id": "m2", "visible": False}],
+                    ["AWS/EBS", "VolumeIdleTime", "VolumeId", volume["VolumeId"], {"region": region, "id": "m3", "visible": False}],
+                    ["AWS/EBS", "VolumeReadBytes", "VolumeId", volume["VolumeId"], {"region": region, "id": "m4", "visible": False}],
+                    ["AWS/EBS", "VolumeWriteBytes", "VolumeId", volume["VolumeId"], {"region": region, "id": "m5", "visible": False}]
                 ],
                 "view": "timeSeries",
                 "stacked": False,
-                "region": "eu-west-1",
+                "region": region,
                 "stat": "Sum",
                 "period": 60,
                 "title": volume["Device"]
@@ -653,9 +792,11 @@ def main():
     global profile_search_entry, profile_menu, instance_search_entry, tree, profiles, instances, selected_profile
     global profile_account_ids
     global localport_entry, remoteport_entry, command_input, command_output, analysis_output
+    global root, connectivity_rows, connectivity_results, connectivity_csv_var, connectivity_timeout_var
+    global connectivity_summary_var, connectivity_input_tree, connectivity_results_tree
 
     root = tk.Tk()
-    root.title("AWS Connector @mndemnk")
+    root.title(f"{APP_NAME} for macOS")
     root.geometry("1440x740")
 
     style = ttk.Style()
@@ -684,6 +825,13 @@ def main():
     powertunnel_frame = create_tab_with_background(notebook, "PowerTunnel", skin_path)
     powercommand_frame = create_tab_with_background(notebook, "PowerCommand", skin_path)
     powerebs_frame = create_tab_with_background(notebook, "PowerEBS", skin_path)
+    connectivity_frame = create_tab_with_background(notebook, "Connectivity", skin_path)
+
+    connectivity_rows = []
+    connectivity_results = []
+    connectivity_csv_var = tk.StringVar(value="No CSV loaded")
+    connectivity_timeout_var = tk.StringVar(value="5")
+    connectivity_summary_var = tk.StringVar(value="Load a CSV and select one source instance in PowerCon.")
 
     profile_frame = tk.Frame(powercon_frame, bg="black", padx=5, pady=5)
     profile_frame.place(x=20, y=20, relwidth=0.95)
@@ -724,7 +872,7 @@ def main():
     connect_button = ttk.Button(instance_frame, text="Connection", command=connect_selected_instances, style="Action.TButton")
     connect_button.grid(row=1, column=2, padx=5, sticky="e")
 
-    banner_label = tk.Label(instance_frame, text="       * Welcome to AWSPowerConn Tool *              @Mndemnk          ", font=("Consolas", 12), bg="black", fg="yellow")
+    banner_label = tk.Label(instance_frame, text=f"       * {APP_NAME} on macOS *        region: {DEFAULT_REGION}        ", font=("Consolas", 12), bg="black", fg="yellow")
     banner_label.grid(row=1, column=3, padx=5, sticky="w")
 
     tree_frame = ttk.Frame(powercon_frame, style="TFrame")
@@ -761,6 +909,35 @@ def main():
     tk.Button(powerebs_frame, text="Select CSV file", command=seleccionar_archivo, font=("Consolas", 12), bg="black", fg="white", activebackground="#222222", activeforeground="white").pack(pady=6)
     analysis_output = tk.Text(powerebs_frame, height=40, width=120, font=("Consolas", 12), bg="black", fg="white", insertbackground="white")
     analysis_output.pack(padx=20, pady=10)
+
+    connectivity_controls = tk.Frame(connectivity_frame, bg="black", padx=12, pady=10)
+    connectivity_controls.pack(fill="x", padx=18, pady=(16, 6))
+    tk.Label(connectivity_controls, text="Connectivity Validation", font=("Consolas", 13), bg="black", fg="yellow").grid(row=0, column=0, padx=5, sticky="w")
+    tk.Label(connectivity_controls, textvariable=connectivity_summary_var, font=("Consolas", 10), bg="black", fg="white", wraplength=820, justify="left").grid(row=0, column=1, columnspan=5, padx=8, sticky="w")
+    tk.Label(connectivity_controls, textvariable=connectivity_csv_var, font=("Consolas", 10), bg="black", fg="#258EFE").grid(row=1, column=0, columnspan=2, padx=5, pady=8, sticky="w")
+    tk.Label(connectivity_controls, text="Timeout (s):", font=("Consolas", 10), bg="black", fg="yellow").grid(row=1, column=2, padx=(18, 3))
+    tk.Entry(connectivity_controls, textvariable=connectivity_timeout_var, width=5, font=("Consolas", 10), bg="white", fg="black").grid(row=1, column=3)
+    ttk.Button(connectivity_controls, text="Load CSV", command=load_connectivity_csv, style="Action.TButton").grid(row=1, column=4, padx=8)
+    ttk.Button(connectivity_controls, text="Run validation", command=run_connectivity_validation, style="Action.TButton").grid(row=1, column=5, padx=4)
+    ttk.Button(connectivity_controls, text="Export HTML", command=export_connectivity_report, style="Action.TButton").grid(row=1, column=6, padx=4)
+
+    input_frame = tk.Frame(connectivity_frame, bg="black", padx=12, pady=8)
+    input_frame.pack(fill="both", expand=True, padx=18, pady=4)
+    tk.Label(input_frame, text="Targets from CSV", font=("Consolas", 11), bg="black", fg="yellow").pack(anchor="w")
+    connectivity_input_tree = ttk.Treeview(input_frame, columns=("Service", "Destination", "Port", "Scope"), show="headings", height=7, style="Treeview")
+    for column, width in (("Service", 280), ("Destination", 500), ("Port", 80), ("Scope", 120)):
+        connectivity_input_tree.heading(column, text=column); connectivity_input_tree.column(column, width=width)
+    connectivity_input_tree.pack(fill="both", expand=True, pady=4)
+
+    results_frame = tk.Frame(connectivity_frame, bg="black", padx=12, pady=8)
+    results_frame.pack(fill="both", expand=True, padx=18, pady=4)
+    tk.Label(results_frame, text="Validation results", font=("Consolas", 11), bg="black", fg="yellow").pack(anchor="w")
+    connectivity_results_tree = ttk.Treeview(results_frame, columns=("Service", "Destination", "Port", "Scope", "Status", "Duration", "Detail"), show="headings", height=10, style="Treeview")
+    for column, width in (("Service", 220), ("Destination", 330), ("Port", 70), ("Scope", 100), ("Status", 100), ("Duration", 100), ("Detail", 450)):
+        connectivity_results_tree.heading(column, text=column); connectivity_results_tree.column(column, width=width)
+    connectivity_results_tree.tag_configure("ok", background="#12351a", foreground="#dcfce7")
+    connectivity_results_tree.tag_configure("ko", background="#381619", foreground="#ffd7d7")
+    connectivity_results_tree.pack(fill="both", expand=True, pady=4)
 
     root.mainloop()
 
