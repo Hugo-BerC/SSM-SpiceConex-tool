@@ -5,7 +5,7 @@ from app.version import __version__
 
 APP_NAME = "SSM-SpiceConex"
 DEFAULT_REGION = "eu-west-1"
-AWS_REGIONS = tuple(dict.fromkeys([DEFAULT_REGION, "us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-southeast-1"]))
+AWS_REGIONS = ("eu-west-1", "eu-south-2", "eu-central-1")
 AWS_TIMEOUT_SECONDS = int(os.environ.get("SSM_SPICECONEX_AWS_TIMEOUT", "20"))
 
 APP_VERSION = __version__
