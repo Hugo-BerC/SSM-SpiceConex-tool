@@ -1101,7 +1101,7 @@ class ConnectivityPage(BasePage):
 
         panel=QFrame(); panel.setObjectName("operationPanel"); form=QVBoxLayout(panel); form.setContentsMargins(22,20,22,22); form.setSpacing(12)
         top=QHBoxLayout(); self.target=QComboBox(); self.target.setMinimumHeight(42); top.addWidget(self._field("SOURCE INSTANCE",self.target),2)
-        self.timeout=QLineEdit("5"); self.timeout.setMinimumHeight(42); top.addWidget(self._field("TIMEOUT (S)",self.timeout),0)
+        self.timeout=QLineEdit("120"); self.timeout.setMinimumHeight(42); top.addWidget(self._field("TIMEOUT (S)",self.timeout),0)
         self.csv_path=QLineEdit(); self.csv_path.setReadOnly(True); self.csv_path.setPlaceholderText("No connectivity CSV loaded"); top.addWidget(self._field("CONNECTIVITY MATRIX",self.csv_path),3)
         self.browse=QPushButton("ATTACH CSV"); self.browse.setObjectName("quietButton"); self.browse.setMinimumHeight(42); top.addWidget(self.browse,0,Qt.AlignmentFlag.AlignBottom)
         self.validate=QPushButton("RUN VALIDATION  →"); self.validate.setObjectName("primaryButton"); self.validate.setMinimumHeight(42); top.addWidget(self.validate,0,Qt.AlignmentFlag.AlignBottom)
