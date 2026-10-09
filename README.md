@@ -1,11 +1,15 @@
 <p align="center">
-  <img src="README-banner.png" alt="SSM-SpiceConex — Arrakis Operations" width="100%">
+  <img src="sidebar_logo.png" alt="SSM-SpiceConex logo" width="460">
 </p>
 
 <h1 align="center">SSM-SpiceConex</h1>
 <p align="center"><strong>AWS operations cockpit for SRE / Cloud Engineering</strong><br>EC2 · SSM · Tunneling · Commands · Performance · Connectivity · Certificates · Architecture</p>
 
 ---
+
+<p align="center">
+  <img src="skin_spiceconex.jpg" alt="Arrakis operations landscape" width="100%">
+</p>
 
 ## What is it?
 
