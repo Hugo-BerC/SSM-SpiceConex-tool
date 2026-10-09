@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from aws.ec2 import list_instances, get_instance_volumes
 from app.config import APP_VERSION
-from app.updater import check_for_update
+from app.updater import check_for_update, launch_update_process
 from aws.identity import get_caller_identity
 from aws.sso import login_profile
 from aws.session import clear_session_cache
@@ -2153,19 +2153,24 @@ class MainWindow(QMainWindow):
     def _update_check_finished(self, info):
         try:
             if not info.get("available"):
-                show_dialog(self, QMessageBox.Icon.Information, "SpiceConex is up to date", f"Version {APP_VERSION} is current on {info.get('remote_sha', '')[:8]}.", f"Branch: main\nCommit: {info.get('remote_sha', '')}\n{info.get('message', '')}")
+                detail = info.get("reason", "")
+                if info.get("available_version"):
+                    detail = f"Installed: {info['installed_version']}\nLatest published: {info['available_version']}\n{detail}"
+                show_dialog(self, QMessageBox.Icon.Information, "SpiceConex update status", detail or f"Version {APP_VERSION} is up to date.")
+                return
+            if not info.get("can_apply"):
+                show_dialog(self, QMessageBox.Icon.Warning, "Update available but blocked", f"Installed: {info['installed_version']}\nAvailable: {info['available_version']}", info.get("reason", ""))
                 return
             answer = QMessageBox.question(
                 self, "SpiceConex update available",
-                f"A newer commit is available on main.\n\nCurrent: {info['local_sha'][:8]}\nNew:     {info['remote_sha'][:8]}\n\n{info.get('message', '')}\n\nUpdate now?",
+                f"A newer published version is available.\n\nInstalled: {info['installed_version']}\nAvailable: {info['available_version']} ({info.get('tag', '')})\n\nUpdate now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            import subprocess
-            subprocess.Popen([sys.executable, "-m", "app.updater", "--apply", str(ROOT.parent), str(os.getpid())], cwd=str(ROOT.parent), close_fds=True)
-            show_dialog(self, QMessageBox.Icon.Information, "Updating SpiceConex", "SpiceConex will close, update from GitHub and restart automatically.", "The updater uses git fetch + git pull --ff-only, refuses to overwrite local changes and refreshes requirements.txt.")
+            launch_update_process(ROOT.parent, os.getpid(), info["tag"])
+            show_dialog(self, QMessageBox.Icon.Information, "Updating SpiceConex", "SpiceConex will close, update from GitHub and restart automatically.", "The independent updater refuses local changes, prepares dependencies before changing source files, then fast-forwards the Git branch.")
             QApplication.instance().quit()
         except Exception as exc:
             logger.exception("Update action failed | %s: %s", type(exc).__name__, exc)
@@ -2193,6 +2198,12 @@ def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--demo",action="store_true"); args=parser.parse_args()
     app=QApplication([]); app.setStyle("Fusion"); app.setStyleSheet(STYLE); app.setFont(QFont("Segoe UI",10))
     if LOGO_SIDEBAR.exists():
-        app.setWindowIcon(QIcon(str(LOGO_SIDEBAR))); window=MainWindow(args.demo); window.show(); app.exec()
+        app.setWindowIcon(QIcon(str(LOGO_SIDEBAR))); window=MainWindow(args.demo); window.show()
+        update_error = ROOT.parent / "update-error.log"
+        if update_error.exists():
+            details = update_error.read_text(encoding="utf-8", errors="replace").strip()
+            update_error.unlink(missing_ok=True)
+            show_dialog(window, QMessageBox.Icon.Warning, "SpiceConex update failed", "SpiceConex has restarted normally. Review the details before trying the update again.", details)
+        app.exec()
 
 if __name__ == "__main__": main()
