@@ -9,3 +9,5 @@ __pycache__/
 .env
 *.spec
 *.dmg
+.spiceconex-update.lock
+update-error.log

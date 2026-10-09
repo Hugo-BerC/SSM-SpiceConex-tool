@@ -15,11 +15,11 @@ The architecture discovery module builds a deterministic AWS resource graph firs
 
 ## Current release
 
-**Version:** `0.4.0-dev`
+**Version:** `0.5.0-dev`
 
 **Update channel:** `main` (Git)
 
-> The in-app updater is intentionally conservative: it uses `git fetch` + `git pull --ff-only`, refuses to overwrite local changes, refreshes Python dependencies, and restarts SpiceConex. The GitHub repository is configured in `app/config.py` before publishing the project.
+> The in-app updater is intentionally conservative: it only accepts published semantic-version Git tags, refuses to overwrite local changes, prepares Python dependencies before changing source files, and restarts SpiceConex.
 
 ## Installation
 
@@ -86,24 +86,33 @@ The update flow is:
 ```text
 CHECK FOR UPDATES
        ↓
-GitHub main / latest commit
+GitHub public semantic-version tags
        ↓
-new commit?
+new version?
    ├── no → already up to date
    └── yes
         ↓
 confirm
         ↓
-git fetch origin main
+git fetch --tags origin main
         ↓
-git pull --ff-only origin main
+install requirements from fetched revision
         ↓
-pip install -r requirements.txt
+git merge --ff-only refs/tags/vX.Y.Z
         ↓
 restart SpiceConex
 ```
 
 Local uncommitted changes are never overwritten automatically.
+
+The updater uses GitHub's public API to discover tags, so it does not need a
+GitHub token or SSH credentials to check for a release. If no version tag has
+been published yet, the UI states this explicitly and makes no change. Publish
+a release by creating an annotated tag such as `v0.5.0`; the tag must refer to
+a commit reachable from the configured update branch. Update checks and network
+work run outside the Qt UI thread. A short-lived lock prevents two update
+processes from running concurrently; errors are recorded locally in
+`update-error.log`.
 
 ## AWS authentication
 
@@ -205,7 +214,7 @@ requirements.txt      Runtime Python dependencies
 
 ## Version history
 
-### 0.4.0-dev — current
+### 0.5.0-dev — current
 
 - Cross-platform terminal launcher redesign.
 - Windows Terminal sessions use new tabs where available.
@@ -213,7 +222,8 @@ requirements.txt      Runtime Python dependencies
 - WSL prefers Windows Terminal over `xterm`.
 - xterm fallback receives an Arrakis dark palette and readable font configuration.
 - Git installed automatically by the bootstrapper.
-- In-app GitHub update workflow added.
+- In-app GitHub update workflow hardened around public semantic-version tags,
+  clean-worktree checks, an out-of-process coordinator and dependency staging.
 - Professional project README / installation documentation.
 
 ### 0.3.x

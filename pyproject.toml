@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssm-spiceconex"
-version = "0.4.2-dev"
+dynamic = ["version"]
 description = "AWS desktop utility for cloud engineers"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,4 +17,7 @@ dependencies = [
   "Pillow>=11.3.0",
   "packaging>=25.0",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "app.version.__version__"}
 
