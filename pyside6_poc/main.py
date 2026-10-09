@@ -1594,14 +1594,8 @@ class ArchitectureMap(QGraphicsView):
         "RDS", "ElastiCache", "DynamoDB", "EFS", "FSx", "S3", "Route53HostedZone", "CloudFront",
         "GlobalAccelerator", "WAF", "TransitGateway", "VPCPeering", "VPCEndpoint", "InternetGateway", "NATGateway",
     }
-    ALWAYS_INDIVIDUAL = {
-        "ALB", "NLB", "Listener", "TargetGroup", "AutoScalingGroup", "ECS", "EKS", "RDS", "ElastiCache",
-        "DynamoDB", "EFS", "FSx", "Route53HostedZone", "CloudFront", "GlobalAccelerator", "TransitGateway",
-        "VPCPeering", "VPCEndpoint", "WAF",
-    }
-    FORCE_AGGREGATE = {"EC2", "Lambda", "S3"}
     HIDDEN_ARCH_TYPES = {"NetworkInterface", "SecurityGroup", "RouteTable", "RouteTarget", "Subnet", "EBS", "ACMCertificate"}
-    LANE_ORDER = ("EDGE", "LOAD BALANCING", "COMPUTE", "DATA")
+    LANE_ORDER = ("EDGE", "NETWORK", "TRAFFIC", "COMPUTE", "DATA & STORAGE")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1684,37 +1678,33 @@ class ArchitectureMap(QGraphicsView):
         t = resource_type.lower()
         if t in {"route53hostedzone", "cloudfront", "globalaccelerator", "waf"}:
             return "EDGE"
+        if t in {"vpc", "transitgateway", "vpcpeering", "vpcendpoint", "internetgateway", "natgateway"}:
+            return "NETWORK"
         if t in {"alb", "nlb", "listener", "targetgroup"}:
-            return "LOAD BALANCING"
+            return "TRAFFIC"
         if t in {"ec2", "autoscalinggroup", "ecs", "eks", "lambda"}:
             return "COMPUTE"
-        return "DATA"
+        return "DATA & STORAGE"
 
     @staticmethod
     def _tag_value(node: ResourceNode, tag_key: str) -> str:
         return node.tags.get(tag_key, "").strip() or "SHARED / UNTAGGED"
 
-    def _group_key(self, node: ResourceNode, graph: InfrastructureGraph, tag_key: str, counts: dict[str, int]):
-        resource_type = node.resource_type
-        if resource_type in self.ALWAYS_INDIVIDUAL:
-            return ("node", node.id)
-        if resource_type in self.FORCE_AGGREGATE:
-            return ("group", resource_type, node.region, self._tag_value(node, tag_key))
-        if counts.get(resource_type, 0) > 12:
-            return ("group", resource_type, node.region, self._tag_value(node, tag_key))
-        return ("node", node.id)
-
     def _build_projection(self, graph: InfrastructureGraph, tag_key: str):
-        counts = graph.resource_counts()
+        """Collapse discovered resources into the AWS service concepts in use.
+
+        This is intentionally not an inventory layout: an EC2 fleet becomes one
+        EC2 concept, for example, and parallel AWS API relationships become one
+        labelled path between service concepts.
+        """
         groups = {}
         member_to_group = {}
         for node in graph.nodes.values():
             if node.resource_type in self.HIDDEN_ARCH_TYPES or node.resource_type not in self.ARCHITECTURE_TYPES:
                 continue
-            key = self._group_key(node, graph, tag_key, counts)
-            gid = node.id if key[0] == "node" else "group::" + "::".join(str(part).replace("/", "_") for part in key[1:])
+            gid = "service::" + node.resource_type
             group = groups.setdefault(gid, {
-                "id": gid, "resource_type": node.resource_type, "name": node.name or node.id,
+                "id": gid, "resource_type": node.resource_type, "name": node.resource_type,
                 "region": node.region, "members": [], "tag": self._tag_value(node, tag_key), "azs": set()
             })
             group["members"].append(node)
@@ -1727,21 +1717,18 @@ class ArchitectureMap(QGraphicsView):
             source = member_to_group.get(edge.source); target = member_to_group.get(edge.target)
             if not source or not target or source == target:
                 continue
-            relation_counts[(source, target, edge.relation)] += 1
-        projected_edges = [{"source": s, "target": t, "relation": r, "count": c} for (s, t, r), c in relation_counts.items()]
+            relation_counts[(source, target)] += 1
+        projected_edges = [{"source": s, "target": t, "count": c} for (s, t), c in relation_counts.items()]
         return groups, projected_edges
 
     @staticmethod
     def _group_title(group):
-        members = group["members"]
-        return members[0].name or members[0].id if len(members) == 1 else f"{group['resource_type']} × {len(members)}"
+        return group["resource_type"]
 
     @staticmethod
     def _group_subtitle(group):
         regions = sorted({m.region for m in group["members"] if m.region})
-        azs = sorted(group["azs"])
-        suffix = f" · {len(azs)} AZ" if len(azs) > 1 else (f" · {azs[0]}" if azs else "")
-        return f"{', '.join(regions) or 'global'}{suffix}"
+        return f"{len(group['members'])} resource{'s' if len(group['members']) != 1 else ''} · {', '.join(regions) or 'global'}"
 
     def render_graph(self, graph: InfrastructureGraph, application: str | None = None,
                      tag_key: str = DEFAULT_TAG_KEY, detail: str = "ARCHITECTURE"):
@@ -1773,18 +1760,15 @@ class ArchitectureMap(QGraphicsView):
 
     def _card(self, group, x, y, w=270, h=102, tag_key=""):
         tagged = group["tag"] != "SHARED / UNTAGGED"
-        fill = QColor(48, 37, 27, 248) if tagged else QColor(20, 26, 27, 248)
+        fill = QColor(31, 30, 24, 248) if tagged else QColor(20, 26, 27, 248)
         border = QColor(211, 145, 77, 235) if tagged else QColor(78, 88, 86, 210)
         card = QGraphicsRectItem(x, y, w, h); card.setBrush(fill); card.setPen(border); card.setToolTip(self._group_tooltip(group, tag_key)); self.scene.addItem(card)
-        self._add_icon(group["resource_type"], x + 12, y + 22, 48)
-        tx = x + 70
+        self._add_icon(group["resource_type"], x + 13, y + 28, 58)
+        tx = x + 82
         type_text = self.scene.addText(group["resource_type"].upper()); type_text.setDefaultTextColor(QColor(SPICE if tagged else SAND)); type_text.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold)); type_text.setPos(tx, y + 10)
-        title = self.scene.addText(self._group_title(group)[:31]); title.setDefaultTextColor(QColor(TEXT)); title.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold)); title.setPos(tx, y + 29)
-        subtitle = self.scene.addText(self._group_subtitle(group)); subtitle.setDefaultTextColor(QColor(MUTED)); subtitle.setFont(QFont("Segoe UI", 7)); subtitle.setPos(tx, y + 53)
-        footer = group["tag"] if tagged else "SHARED / UNTAGGED"
-        if len(group["members"]) > 1:
-            footer += f" · {len(group['members'])} resources"
-        foot = self.scene.addText(footer[:38]); foot.setDefaultTextColor(QColor(SPICE if tagged else SAND)); foot.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold)); foot.setPos(tx, y + 73)
+        title = self.scene.addText(f"{len(group['members'])} discovered resource{'s' if len(group['members']) != 1 else ''}"); title.setDefaultTextColor(QColor(TEXT)); title.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold)); title.setPos(tx, y + 30)
+        subtitle = self.scene.addText(self._group_subtitle(group)); subtitle.setDefaultTextColor(QColor(MUTED)); subtitle.setFont(QFont("Segoe UI", 7)); subtitle.setPos(tx, y + 52)
+        foot = self.scene.addText("Hover for discovered members"); foot.setDefaultTextColor(QColor(SPICE if tagged else SAND)); foot.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold)); foot.setPos(tx, y + 77)
         return card
 
     @staticmethod
@@ -1798,8 +1782,46 @@ class ArchitectureMap(QGraphicsView):
             lines.append(f"… +{len(group['members']) - 25} more")
         return "\n".join(lines)
 
+    def _render_conceptual(self, graph, groups, projected_edges, tag_key):
+        """Draw the selected architecture as service concepts in layered lanes."""
+        node_w, node_h, lane_w, gap_y = 220, 112, 272, 28
+        lanes = defaultdict(list)
+        for group in groups.values():
+            lanes[self._lane(group["resource_type"])].append(group)
+        max_rows = max((len(lanes[lane]) for lane in self.LANE_ORDER), default=1)
+        diagram_h = max(430, 128 + max_rows * (node_h + gap_y))
+        positions = {}
+        for index, lane in enumerate(self.LANE_ORDER):
+            x = 46 + index * lane_w
+            band = self.scene.addRect(x - 18, 54, node_w + 36, diagram_h - 72)
+            band.setBrush(QColor(16, 22, 23, 190)); band.setPen(QPen(QColor(62, 72, 69, 190), 1)); band.setZValue(-20)
+            title = self.scene.addText(lane)
+            title.setDefaultTextColor(QColor(SPICE if lane in {"EDGE", "TRAFFIC"} else SAND))
+            title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold)); title.setPos(x, 68)
+            for row, group in enumerate(sorted(lanes[lane], key=lambda item: item["resource_type"])):
+                positions[group["id"]] = (x, 108 + row * (node_h + gap_y))
+        for rel in projected_edges:
+            if rel["source"] not in positions or rel["target"] not in positions:
+                continue
+            x1, y1 = positions[rel["source"]]; x2, y2 = positions[rel["target"]]
+            if x1 <= x2: sx, sy, tx, ty = x1 + node_w, y1 + node_h / 2, x2, y2 + node_h / 2
+            else: sx, sy, tx, ty = x1, y1 + node_h / 2, x2 + node_w, y2 + node_h / 2
+            bend = (sx + tx) / 2
+            path = QPainterPath(QPointF(sx, sy)); path.cubicTo(bend, sy, bend, ty, tx, ty)
+            line = QGraphicsPathItem(path); line.setPen(QPen(QColor(199, 165, 106, 185), 2.1)); line.setZValue(-2)
+            line.setToolTip(f"Observed relationships: {rel['count']}"); self.scene.addItem(line)
+        for group in groups.values():
+            x, y = positions[group["id"]]
+            card = self._card(group, x, y, w=node_w, h=node_h, tag_key=tag_key); card.setZValue(1)
+        legend = self.scene.addText(f"CONCEPT MAP  |  {len(groups)} AWS service types  |  {len(projected_edges)} service relationships  |  {len(graph.nodes)} discovered resources consolidated")
+        legend.setDefaultTextColor(QColor(SAND)); legend.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold)); legend.setPos(24, 16)
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-30, -28, 40, 35))
+        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
     def _render_architecture(self, graph, groups, projected_edges, tag_key, application):
         """Region/VPC topology, with AZ-aware compute grouping and direct API edges."""
+        self._render_conceptual(graph, groups, projected_edges, tag_key)
+        return
         from collections import Counter
         from math import ceil
 
@@ -1964,7 +1986,7 @@ class ArchitecturePage(BasePage):
         app_label = QLabel("APPLICATION / COMPONENT"); app_label.setObjectName("microLabel")
         self.application = QComboBox(); self.application.setEditable(False); self.application.addItem("ALL PRODUCTS"); self.application.setMinimumHeight(38)
         detail_label = QLabel("MAP DETAIL"); detail_label.setObjectName("microLabel")
-        self.map_detail = QComboBox(); self.map_detail.addItems(["ARCHITECTURE", "FULL RESOURCE GRAPH"]); self.map_detail.setMinimumHeight(38)
+        self.map_detail = QComboBox(); self.map_detail.addItems(["CONCEPT MAP"]); self.map_detail.setMinimumHeight(38)
         self.discover = QPushButton("DISCOVER INFRASTRUCTURE  →"); self.discover.setObjectName("primaryButton"); self.discover.setMinimumHeight(38)
         self.refresh_view = QPushButton("REFRESH VIEW  ↻"); self.refresh_view.setObjectName("quietButton"); self.refresh_view.setMinimumHeight(38); self.refresh_view.setEnabled(False)
         self.export_csv = QPushButton("EXPORT CSV"); self.export_csv.setObjectName("quietButton"); self.export_csv.setMinimumHeight(38); self.export_csv.setEnabled(False)
@@ -1983,19 +2005,16 @@ class ArchitecturePage(BasePage):
         self.count = QLabel("0 RESOURCES"); self.count.setObjectName("sectionCounter"); summary.addWidget(self.count)
         root.addLayout(summary)
 
-        self.tabs = QTabWidget(); self.tabs.setObjectName("inventoryTabs")
         self.inventory = FilterableTable(self.RESOURCE_COLUMNS, filter_options={"Type": [], "Region": [], "Application": []})
-        self.tabs.addTab(self.inventory, "RESOURCE INVENTORY")
         map_page = QWidget(); map_layout = QVBoxLayout(map_page); map_layout.setContentsMargins(0, 0, 0, 0); map_layout.setSpacing(8)
         map_toolbar = QHBoxLayout(); map_toolbar.setSpacing(8)
-        map_hint = QLabel("Drag to pan · mouse wheel to zoom · hover nodes/edges for relationship details")
+        map_hint = QLabel("AWS service concept map · layers represent the runtime path · hover a service or path for discovered members and relationships")
         map_hint.setObjectName("footerText"); map_toolbar.addWidget(map_hint); map_toolbar.addStretch()
         self.export_png = QPushButton("EXPORT PNG"); self.export_png.setObjectName("quietButton"); self.export_png.setMinimumHeight(34); self.export_png.setEnabled(False)
         map_toolbar.addWidget(self.export_png)
         map_layout.addLayout(map_toolbar)
         self.map = ArchitectureMap(); map_layout.addWidget(self.map, 1)
-        self.tabs.addTab(map_page, "ARCHITECTURE MAP")
-        root.addWidget(self.tabs, 1)
+        root.addWidget(map_page, 1)
 
         self.status_detail = QLabel("Discovery has not been run."); self.status_detail.setObjectName("footerText"); self.status_detail.setWordWrap(True); root.addWidget(self.status_detail)
         self.discover.clicked.connect(self.run_discovery)
@@ -2115,7 +2134,7 @@ class ArchitecturePage(BasePage):
         self.map.render_graph(scoped, application, tag_key, detail=self.map_detail.currentText())
 
     def clear_view(self):
-        self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("ARCHITECTURE"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
+        self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("CONCEPT MAP"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
 
     @staticmethod
     def _demo_graph():
