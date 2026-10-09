@@ -1044,6 +1044,55 @@ class CertificatesPage(BasePage):
         self.worker = None
 
 
+class ConnectivityMap(QGraphicsView):
+    """A compact, result-aware topology for a loaded connectivity matrix."""
+    def __init__(self):
+        super().__init__()
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setBackgroundBrush(QColor(9, 13, 14))
+        self.setFrameShape(QFrame.Shape.NoFrame)
+
+    def wheelEvent(self, event):
+        self.scale(1.15 if event.angleDelta().y() > 0 else 1 / 1.15, 1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+
+    def render_connections(self, source_name, rows, results=None):
+        self.scene.clear()
+        result_map = {(str(item.get("service", "")), str(item.get("destination", "")), str(item.get("port", "")), str(item.get("scope", ""))): item for item in (results or [])}
+        if not rows:
+            hint = self.scene.addText("Attach a connectivity CSV to render the connection map.")
+            hint.setDefaultTextColor(QColor(MUTED)); hint.setPos(28, 28); self.scene.setSceneRect(0, 0, 820, 380); return
+        source_x, source_y, source_w, source_h = 48, 80, 245, 92
+        source = self.scene.addRect(source_x, source_y, source_w, source_h)
+        source.setBrush(QColor(23, 31, 31)); source.setPen(QPen(QColor(SPICE), 2))
+        source.setToolTip("Managed EC2 instance used as the source of every SSM TCP test.")
+        label = self.scene.addText("SSM TEST SOURCE"); label.setDefaultTextColor(QColor(SAND)); label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold)); label.setPos(source_x + 14, source_y + 12)
+        label = self.scene.addText((source_name or "Select a source instance")[:31]); label.setDefaultTextColor(QColor(TEXT)); label.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold)); label.setPos(source_x + 14, source_y + 38)
+        groups = {"internal": [], "external": [], "unknown": []}
+        for row in rows: groups.get(str(row.get("scope", "")).lower(), groups["unknown"]).append(row)
+        columns = [("internal", "INTERNAL DESTINATIONS"), ("external", "EXTERNAL DESTINATIONS"), ("unknown", "OTHER DESTINATIONS")]
+        target_x, max_rows = 405, max((len(groups[name]) for name, _ in columns), default=1)
+        for column, (scope, heading) in enumerate(columns):
+            column_x = target_x + column * 305
+            title = self.scene.addText(heading); title.setDefaultTextColor(QColor(SAND if scope != "external" else SPICE)); title.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold)); title.setPos(column_x, 18)
+            for index, row in enumerate(groups[scope]):
+                y = 62 + index * 104
+                result = result_map.get((row["service"], row["destination"], row["port"], row["scope"]), {})
+                status = str(result.get("status", "")).upper()
+                color = QColor(GREEN if status == "OK" else RED if status in {"KO", "FAILED", "ERROR", "TIMEOUT", "REFUSED", "UNREACHABLE"} else MUTED)
+                line = QGraphicsLineItem(source_x + source_w, source_y + source_h / 2, column_x, y + 39); line.setPen(QPen(color, 2 if status else 1.2)); line.setToolTip(f"{row['service']} → {row['destination']}:{row['port']} · {status or 'PENDING'}"); self.scene.addItem(line)
+                card = self.scene.addRect(column_x, y, 265, 78); card.setBrush(QColor(18, 23, 24)); card.setPen(QPen(color, 1.6)); card.setToolTip(f"Service: {row['service']}\nDestination: {row['destination']}:{row['port']}\nScope: {row['scope']}\nProtocol: {row['protocol']}\nStatus: {status or 'Not tested'}\n{result.get('detail', '')}")
+                text = self.scene.addText(row["service"][:30]); text.setDefaultTextColor(QColor(TEXT)); text.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold)); text.setPos(column_x + 12, y + 10)
+                text = self.scene.addText(f"{row['destination']}:{row['port']}  ·  {row['protocol']}"); text.setDefaultTextColor(QColor(MUTED)); text.setFont(QFont("Segoe UI", 8)); text.setPos(column_x + 12, y + 32)
+                text = self.scene.addText(status or "PENDING"); text.setDefaultTextColor(color); text.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold)); text.setPos(column_x + 12, y + 54)
+        legend = self.scene.addText("CONNECTION MAP  ·  green: reachable  ·  red: failed or timed out  ·  grey: not tested")
+        legend.setDefaultTextColor(QColor(MUTED)); legend.setFont(QFont("Segoe UI", 8)); legend.setPos(24, 14)
+        self.scene.setSceneRect(0, 0, target_x + len(columns) * 305, max(290, 92 + max_rows * 104))
+        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+
 class ConnectivityPage(BasePage):
     """CSV-driven connectivity validation migrated from the legacy UI."""
     def __init__(self, source):
@@ -1067,7 +1116,12 @@ class ConnectivityPage(BasePage):
         right=QFrame(); right.setObjectName("operationPanel"); rf=QVBoxLayout(right); rf.setContentsMargins(16,14,16,14); rf.addWidget(self._label("VALIDATION RESULTS"))
         self.results_table=QTableWidget(0,7); self._setup_table(self.results_table,["Service","Destination","Port","Scope","Status","Duration","Detail"]); rf.addWidget(self.results_table,1)
         splitter.addWidget(right,2)
-        root.addLayout(splitter,1)
+        matrix_page=QWidget(); matrix_layout=QVBoxLayout(matrix_page); matrix_layout.setContentsMargins(0,0,0,0); matrix_layout.addLayout(splitter,1)
+        self.tabs=QTabWidget(); self.tabs.setObjectName("inventoryTabs"); self.tabs.addTab(matrix_page,"MATRIX & RESULTS")
+        map_page=QWidget(); map_layout=QVBoxLayout(map_page); map_layout.setContentsMargins(0,0,0,0)
+        map_hint=QLabel("Drag to pan · mouse wheel to zoom · hover paths for test details"); map_hint.setObjectName("footerText"); map_layout.addWidget(map_hint)
+        self.connection_map=ConnectivityMap(); map_layout.addWidget(self.connection_map,1); self.tabs.addTab(map_page,"CONNECTION MAP")
+        root.addWidget(self.tabs,1)
         self.detail=QPlainTextEdit(); self.detail.setReadOnly(True); self.detail.setMaximumHeight(150); self.detail.setPlaceholderText("Select a validation result for details."); root.addWidget(self.detail)
 
         source.instancesChanged.connect(self.set_instances); self.browse.clicked.connect(self.choose_csv); self.validate.clicked.connect(self.run); self.results_table.itemSelectionChanged.connect(self.show_detail); self.set_instances(source.instances)
@@ -1082,6 +1136,10 @@ class ConnectivityPage(BasePage):
         self.target.blockSignals(True); self.target.clear()
         for i in instances: self.target.addItem(f"{i.name} · {i.instance_id}",i)
         self.target.blockSignals(False)
+        if self.rows: self.connection_map.render_connections(self._source_name(),self.rows)
+    def _source_name(self):
+        instance=self.target.currentData()
+        return f"{instance.name} · {instance.instance_id}" if instance else ""
     def choose_csv(self):
         path = _open_csv_dialog(self, "Attach connectivity CSV")
         if not path: return
@@ -1090,6 +1148,7 @@ class ConnectivityPage(BasePage):
             for row in rows:
                 r=self.input_table.rowCount(); self.input_table.insertRow(r)
                 for c,key in enumerate(("service","destination","port","scope","protocol")): self.input_table.setItem(r,c,QTableWidgetItem(row[key]))
+            self.connection_map.render_connections(self._source_name(),rows)
             self.summary.setText(f"Loaded {len(rows)} services from {Path(path).name}")
             logger.info("Connectivity CSV attached | file=%s | services=%d", path, len(rows))
         except Exception as exc:
@@ -1106,7 +1165,8 @@ class ConnectivityPage(BasePage):
         if timeout < 1 or timeout > 300:
             show_dialog(self,QMessageBox.Icon.Warning,"Invalid timeout","The connectivity timeout must be between 1 and 300 seconds.","Enter a valid timeout and retry."); return
         self.validate.setEnabled(False); self.browse.setEnabled(False); self.summary.setText(f"Running validation from {i.name} in {region}…"); self.results_table.setRowCount(0); self.detail.clear()
-        self.thread=QThread(); self.worker=Worker(lambda: validate_connectivity_csv(profile,region,i.instance_id,self.rows,timeout)); self.worker.moveToThread(self.thread); worker=self.worker
+        self.connection_map.render_connections(self._source_name(),self.rows)
+        self.thread=QThread(); self.worker=Worker(lambda: _run_with_sso(profile,lambda: validate_connectivity_csv(profile,region,i.instance_id,self.rows,timeout))); self.worker.moveToThread(self.thread); worker=self.worker
         self.thread.started.connect(worker.run); worker.finished.connect(self.finished); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
     @Slot(object)
     def finished(self,payload):
@@ -1122,6 +1182,7 @@ class ConnectivityPage(BasePage):
                     else: item.setForeground(QColor(SAND))
                 self.results_table.setItem(r,c,item)
         ok=sum(1 for r in results if r.get("status","").upper()=="OK"); ko=len(results)-ok
+        self.connection_map.render_connections(self._source_name(),self.rows,results)
         self.summary.setText(f"Validated {len(results)} services · OK {ok} · KO {ko} · Source {self.target.currentData().name if self.target.currentData() else ''} · Region {self.source.commands.region.currentText()}")
         self.validate.setEnabled(True); self.browse.setEnabled(True)
         logger.info("Connectivity UI updated | results=%d | ok=%d | ko=%d",len(results),ok,ko)
@@ -2153,6 +2214,9 @@ class MainWindow(QMainWindow):
     def _update_check_finished(self, info):
         try:
             if not info.get("available"):
+                if info.get("available_version") is None:
+                    show_dialog(self, QMessageBox.Icon.Information, "No release published yet", f"Installed development build: {info['installed_version']}", "Update checking is working. Publish a semantic-version Git tag (for example v0.5.0) on the update branch to enable automatic upgrades.")
+                    return
                 detail = info.get("reason", "")
                 if info.get("available_version"):
                     detail = f"Installed: {info['installed_version']}\nLatest published: {info['available_version']}\n{detail}"
