@@ -1763,12 +1763,14 @@ class ArchitectureMap(QGraphicsView):
         fill = QColor(31, 30, 24, 248) if tagged else QColor(20, 26, 27, 248)
         border = QColor(211, 145, 77, 235) if tagged else QColor(78, 88, 86, 210)
         card = QGraphicsRectItem(x, y, w, h); card.setBrush(fill); card.setPen(border); card.setToolTip(self._group_tooltip(group, tag_key)); self.scene.addItem(card)
-        self._add_icon(group["resource_type"], x + 13, y + 28, 58)
+        icon = self._add_icon(group["resource_type"], x + 13, y + 28, 58)
+        if icon:
+            icon.setZValue(3)
         tx = x + 82
-        type_text = self.scene.addText(group["resource_type"].upper()); type_text.setDefaultTextColor(QColor(SPICE if tagged else SAND)); type_text.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold)); type_text.setPos(tx, y + 10)
-        title = self.scene.addText(f"{len(group['members'])} discovered resource{'s' if len(group['members']) != 1 else ''}"); title.setDefaultTextColor(QColor(TEXT)); title.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold)); title.setPos(tx, y + 30)
-        subtitle = self.scene.addText(self._group_subtitle(group)); subtitle.setDefaultTextColor(QColor(MUTED)); subtitle.setFont(QFont("Segoe UI", 7)); subtitle.setPos(tx, y + 52)
-        foot = self.scene.addText("Hover for discovered members"); foot.setDefaultTextColor(QColor(SPICE if tagged else SAND)); foot.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold)); foot.setPos(tx, y + 77)
+        type_text = self.scene.addText(group["resource_type"].upper()); type_text.setDefaultTextColor(QColor(SPICE if tagged else SAND)); type_text.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold)); type_text.setPos(tx, y + 10); type_text.setZValue(2)
+        title = self.scene.addText(f"{len(group['members'])} discovered resource{'s' if len(group['members']) != 1 else ''}"); title.setDefaultTextColor(QColor(TEXT)); title.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold)); title.setPos(tx, y + 30); title.setZValue(2)
+        subtitle = self.scene.addText(self._group_subtitle(group)); subtitle.setDefaultTextColor(QColor(MUTED)); subtitle.setFont(QFont("Segoe UI", 7)); subtitle.setPos(tx, y + 52); subtitle.setZValue(2)
+        foot = self.scene.addText("Hover for discovered members"); foot.setDefaultTextColor(QColor(SPICE if tagged else SAND)); foot.setFont(QFont("Segoe UI", 7, QFont.Weight.DemiBold)); foot.setPos(tx, y + 77); foot.setZValue(2)
         return card
 
     @staticmethod
