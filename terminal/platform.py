@@ -12,8 +12,27 @@ def _is_wsl() -> bool:
 
 
 
+def _wsl_interop_available() -> bool:
+    """Windows executables require a registered WSLInterop binary handler."""
+    return Path("/proc/sys/fs/binfmt_misc/WSLInterop").is_file()
+
+
+def _windows_terminal_on_windows() -> str | None:
+    direct = shutil.which("wt.exe")
+    if direct:
+        return direct
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        alias = Path(local_app_data) / "Microsoft" / "WindowsApps" / "wt.exe"
+        if alias.is_file():
+            return str(alias)
+    return None
+
+
 def _windows_terminal_in_wsl() -> str | None:
     """Locate the Windows Terminal app execution alias from inside WSL."""
+    if not _wsl_interop_available():
+        return None
     direct = shutil.which("wt.exe")
     if direct:
         return direct
@@ -69,6 +88,22 @@ def _powershell_quote(command: str) -> str:
     return command.replace("'", "''")
 
 
+def _xterm_arguments(terminal: str, title: str, command: str) -> list[str]:
+    """Use explicit options and Xresources so a user theme cannot make xterm unreadable."""
+    return [
+        terminal, "-T", title, "-geometry", "150x42",
+        "-bg", "#0B0A08", "-fg", "#F0E8D8", "-cr", "#D3914D", "-bd", "#4A3529",
+        "-fa", "DejaVu Sans Mono", "-fs", "18",
+        "-xrm", "XTerm*vt100.background: #0B0A08",
+        "-xrm", "XTerm*vt100.foreground: #F0E8D8",
+        "-xrm", "XTerm*faceName: DejaVu Sans Mono",
+        "-xrm", "XTerm*faceSize: 18",
+        "-xrm", "XTerm*selectToClipboard: true",
+        "-xrm", "*VT100.translations: #override <Key>Insert: string(\"\\033[2~\")",
+        "-e", "bash", "-lc", command,
+    ]
+
+
 def open_command(command: str, title: str | None = None):
     system = platform.system()
     window_title = title or "SSM-SpiceConex"
@@ -84,11 +119,12 @@ def open_command(command: str, title: str | None = None):
         return subprocess.Popen(["osascript", "-e", script])
 
     if system == "Windows":
-        terminal = find_terminal()
+        terminal = _windows_terminal_on_windows()
+        if terminal:
+            return subprocess.Popen([terminal, "-w", "0", "new-tab", "--title", window_title, "powershell.exe", "-NoExit", command])
+        terminal = shutil.which("powershell.exe")
         if not terminal:
             raise RuntimeError("No supported Windows terminal found.")
-        if os.path.basename(terminal).lower().startswith("wt"):
-            return subprocess.Popen([terminal, "new-tab", "--title", window_title, "powershell.exe", "-NoExit", command])
         return subprocess.Popen([terminal, "-NoExit", command])
 
     if _is_wsl():
@@ -112,17 +148,7 @@ def open_command(command: str, title: str | None = None):
     name = os.path.basename(os.path.realpath(terminal)).lower()
 
     if name in {"xterm", "uxterm"}:
-        return subprocess.Popen([
-            terminal, "-T", window_title,
-            "-xrm", "*background: #0B0A08",
-            "-xrm", "*foreground: #D8C39B",
-            "-xrm", "*cursorColor: #C99A5A",
-            "-xrm", "*selectToClipboard: true",
-            "-xrm", "*VT100.translations: #override <Key>Insert: string(\"\\033[2~\")",
-            "-bg", "#0B0A08", "-fg", "#D8C39B", "-cr", "#C99A5A",
-            "-fa", "DejaVu Sans Mono", "-fs", "14",
-            "-e", "bash", "-lc", command,
-        ])
+        return subprocess.Popen(_xterm_arguments(terminal, window_title, command))
 
     if name in {"gnome-terminal", "kgx"}:
         return subprocess.Popen([terminal, "--title", window_title, "--", "bash", "-lc", command])
