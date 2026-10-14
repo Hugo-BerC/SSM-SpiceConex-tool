@@ -63,8 +63,13 @@ def discover_vpc_flow_inventory(profile: str, region: str) -> dict:
     vpcs = []
     for page in ec2.get_paginator("describe_vpcs").paginate():
         for item in page.get("Vpcs", []):
+            name = next(
+                (tag.get("Value", "").strip() for tag in item.get("Tags", []) if tag.get("Key") == "Name"),
+                "",
+            )
             vpcs.append({
                 "VpcId": item.get("VpcId", ""),
+                "Name": name,
                 "CidrBlocks": [
                     association.get("CidrBlock")
                     for association in item.get("CidrBlockAssociationSet", [])

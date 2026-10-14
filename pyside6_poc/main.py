@@ -143,6 +143,10 @@ class DuneBackdrop(QWidget):
         super().__init__(parent)
         self.texture = QPixmap(str(TEXTURE)) if TEXTURE.exists() else QPixmap()
         self.skin = QPixmap(str(SKIN)) if SKIN.exists() else QPixmap()
+        # Pages can tune their atmosphere without changing the shared artwork.
+        self.texture_opacity = 0.14
+        self.skin_opacity = 0.13
+        self.shade_opacity = (58, 28, 18)
         self.setObjectName("backdrop")
 
     def paintEvent(self, event):
@@ -151,11 +155,11 @@ class DuneBackdrop(QWidget):
         painter.fillRect(self.rect(), QColor(VOID))
         if not self.texture.isNull():
             texture = self.texture.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.setOpacity(0.14)
+            painter.setOpacity(self.texture_opacity)
             painter.drawPixmap((self.width() - texture.width()) // 2, (self.height() - texture.height()) // 2, texture)
         if not self.skin.isNull():
             skin = self.skin.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.setOpacity(0.13)
+            painter.setOpacity(self.skin_opacity)
             painter.drawPixmap((self.width() - skin.width()) // 2, (self.height() - skin.height()) // 2, skin)
         glow = QRadialGradient(self.width() * 0.82, self.height() * 0.78, max(self.width(), self.height()) * 0.42)
         glow.setColorAt(0.0, QColor(211, 145, 77, 28))
@@ -163,9 +167,9 @@ class DuneBackdrop(QWidget):
         painter.setOpacity(1.0)
         painter.fillRect(self.rect(), glow)
         gradient = QLinearGradient(0, 0, self.width(), 0)
-        gradient.setColorAt(0.0, QColor(0, 0, 0, 58))
-        gradient.setColorAt(0.55, QColor(0, 0, 0, 28))
-        gradient.setColorAt(1.0, QColor(0, 0, 0, 18))
+        gradient.setColorAt(0.0, QColor(0, 0, 0, self.shade_opacity[0]))
+        gradient.setColorAt(0.55, QColor(0, 0, 0, self.shade_opacity[1]))
+        gradient.setColorAt(1.0, QColor(0, 0, 0, self.shade_opacity[2]))
         painter.fillRect(self.rect(), gradient)
         painter.end()
 
@@ -203,12 +207,13 @@ class Sidebar(QFrame):
         layout.addSpacing(8)
 
         self.buttons = []
-        entries = [("◆", "TERMINAL"), ("◇", "TUNNELING"), ("◇", "COMMAND"), ("◇", "PERFORMANCE"), ("◇", "CONNECTIVITY"), ("◇", "FLOW LOGS"), ("◇", "CERTIFICATES"), ("◇", "ARCHITECTURE")]
-        for index, (glyph, title) in enumerate(entries):
-            button = QToolButton(); button.setText(f"{glyph}   {title}"); button.setCheckable(True); button.setAutoExclusive(True)
+        entries = ["HOME", "TERMINAL", "TUNNELING", "COMMAND", "PERFORMANCE", "CONNECTIVITY", "FLOW LOGS", "CERTIFICATES", "ARCHITECTURE"]
+        for index, title in enumerate(entries):
+            button = QToolButton(); button.setText(f"◇   {title}"); button.setCheckable(True); button.setAutoExclusive(True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly); button.setObjectName("navButton")
             button.setFixedHeight(36)
             button.clicked.connect(lambda checked, idx=index: self.pageRequested.emit(idx))
+            button.toggled.connect(lambda checked, item=button, label=title: item.setText(f"{'◆' if checked else '◇'}   {label}"))
             layout.addWidget(button)
             self.buttons.append(button)
             if index < len(entries) - 1:
@@ -230,11 +235,16 @@ class Sidebar(QFrame):
     def set_profile(self, profile, region):
         self.profile.setText(f"{profile or 'default'}\n{region}")
 
+    def set_current_page(self, index):
+        if 0 <= index < len(self.buttons):
+            self.buttons[index].setChecked(True)
 
-class CommandRail(QFrame):
+
+class AwsConnectionRail(QFrame):
+    """The single visual entry point for selecting and connecting AWS context."""
     def __init__(self):
         super().__init__(); self.setObjectName("commandRail")
-        layout = QHBoxLayout(self); layout.setContentsMargins(18, 14, 18, 14); layout.setSpacing(10)
+        layout = QHBoxLayout(self); layout.setContentsMargins(22, 18, 22, 18); layout.setSpacing(10)
         left = QVBoxLayout(); left.setSpacing(2); label = QLabel("AWS PROFILE"); label.setObjectName("microLabel")
         self.profile = QComboBox()
         self.profile.setMinimumWidth(245)
@@ -251,14 +261,11 @@ class CommandRail(QFrame):
         self.region = QComboBox(); self.region.setEditable(True); self.region.addItems(["us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-southeast-1"])
         self.region.setCurrentText(DEFAULT_REGION)
         region.addWidget(region_label); region.addWidget(self.region); layout.addLayout(region)
-        self.refresh = QPushButton("↻  REFRESH"); self.refresh.setObjectName("quietButton"); self.refresh.setMinimumHeight(42); self.refresh.setToolTip("Load the EC2 fleet for the selected AWS profile and region"); layout.addWidget(self.refresh, 0, Qt.AlignmentFlag.AlignBottom)
+        self.configure_profiles = QToolButton(); self.configure_profiles.setText("⚙"); self.configure_profiles.setObjectName("quietButton"); self.configure_profiles.setToolTip("Configure or regenerate AWS profiles"); self.configure_profiles.setFixedSize(42,42); layout.addWidget(self.configure_profiles, 0, Qt.AlignmentFlag.AlignBottom)
+        self.refresh_profiles = QPushButton("↻  REFRESH PROFILES"); self.refresh_profiles.setObjectName("quietButton"); self.refresh_profiles.setMinimumHeight(42); self.refresh_profiles.setToolTip("Reload the local AWS profile list without contacting AWS"); layout.addWidget(self.refresh_profiles, 0, Qt.AlignmentFlag.AlignBottom)
         self.validate = QPushButton("✓  VALIDATE"); self.validate.setObjectName("quietButton"); self.validate.setMinimumHeight(42); layout.addWidget(self.validate, 0, Qt.AlignmentFlag.AlignBottom)
         layout.addStretch(1)
-        search = QVBoxLayout(); search.setSpacing(2); search_label = QLabel("FLEET SEARCH"); search_label.setObjectName("microLabel")
-        self.search = QLineEdit(); self.search.setPlaceholderText("Name, instance ID or private IP"); self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(320)
-        search.addWidget(search_label); search.addWidget(self.search); layout.addLayout(search)
-        self.connect = QPushButton("CONNECT  →"); self.connect.setObjectName("primaryButton"); self.connect.setMinimumHeight(42); layout.addWidget(self.connect, 0, Qt.AlignmentFlag.AlignBottom)
-        self.configure_profiles = QToolButton(); self.configure_profiles.setText("⚙"); self.configure_profiles.setObjectName("quietButton"); self.configure_profiles.setToolTip("Configure or regenerate AWS profiles"); self.configure_profiles.setFixedSize(42,42); layout.addWidget(self.configure_profiles, 0, Qt.AlignmentFlag.AlignBottom)
+        self.connect = QPushButton("CONNECT TO AWS  →"); self.connect.setObjectName("primaryButton"); self.connect.setMinimumHeight(42); self.connect.setToolTip("Connect the selected AWS profile and load its EC2 fleet in Terminal"); layout.addWidget(self.connect, 0, Qt.AlignmentFlag.AlignBottom)
         shadow(self, 24, 7, 55)
 
 
@@ -565,85 +572,109 @@ class AWSProfileSetupDialog(QDialog):
         self.accept()
 
 
-class PowerCon(BasePage):
-    instancesChanged = Signal(object)
+class HomePage(DuneBackdrop):
+    """Landing page: choose and authenticate AWS context before using operations."""
+    connected = Signal()
+
     def __init__(self, sidebar, demo=False):
-        super().__init__(); self.sidebar = sidebar; self.demo = demo; self.instances=[]; self.thread=None
-        root = self.page_header("SECURE INSTANCE ACCESS / TERMINAL", "Terminal", "Control access to your EC2 fleet from one operational surface.", "◆  DEMO MODE" if demo else "◆  READY")
-        self.commands=CommandRail(); root.addWidget(self.commands); self.metrics=MetricStrip(); root.addWidget(self.metrics); self.fleet=FleetPanel(); root.addWidget(self.fleet,1)
-        footer=QHBoxLayout(); tip=QLabel("COMMAND PALETTE    CTRL + K"); tip.setObjectName("footerText"); footer.addWidget(tip); footer.addStretch(); mark=QLabel("ARRAKIS  /  AWS"); mark.setObjectName("footerMark"); footer.addWidget(mark); root.addLayout(footer)
-        self.commands.configure_profiles.clicked.connect(self.configure_profiles); self.commands.refresh.clicked.connect(self.load); self.commands.validate.clicked.connect(self.validate_profile); self.commands.search.textChanged.connect(self.fleet.filter)
-        self.commands.region.currentTextChanged.connect(self._region_changed); self.commands.profile.currentTextChanged.connect(self._profile_changed)
-        self.fleet.selectionChanged.connect(lambda c:self.metrics.set_value("selected",c)); self.commands.connect.clicked.connect(self.connect_target); self.load_profiles()
-        if demo: self.set_instances(demo_instances())
+        super().__init__(); self.sidebar=sidebar; self.demo=demo; self.thread=None; self.worker=None; self.terminal=None
+        # Home is intentionally brighter than the operational pages: it is the
+        # visual entry point and should let the Arrakis wallpaper breathe.
+        self.texture_opacity = 0.06
+        self.skin_opacity = 0.46
+        self.shade_opacity = (18, 10, 6)
+        root=QVBoxLayout(self); root.setContentsMargins(52, 42, 52, 42); root.setSpacing(0)
+        self.commands=AwsConnectionRail(); root.addWidget(self.commands)
+        root.addSpacing(14)
+        self.context=QLabel("Select an AWS profile and region, then connect to load the EC2 fleet."); self.context.setObjectName("homeContext"); self.context.setAlignment(Qt.AlignmentFlag.AlignCenter); root.addWidget(self.context)
+        root.addStretch(1)
+        self.commands.configure_profiles.clicked.connect(self.configure_profiles); self.commands.refresh_profiles.clicked.connect(self.load_profiles); self.commands.validate.clicked.connect(self.validate_profile); self.commands.connect.clicked.connect(self.connect_aws)
+        self.commands.region.currentTextChanged.connect(self._context_changed); self.commands.profile.currentTextChanged.connect(self._context_changed)
+        self.load_profiles()
+
+    def set_terminal(self, terminal): self.terminal=terminal
+    def _context_changed(self, *_):
+        profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip() or DEFAULT_REGION
+        self.sidebar.set_profile(profile, region)
+        self.context.setText("AWS context changed. Connect to AWS when you are ready to load the EC2 fleet.")
+        if self.terminal and not self.demo: self.terminal.context_changed()
     def load_profiles(self):
-        logger.info("Loading AWS profiles")
+        logger.info("Loading AWS profiles for Home")
         try:
-            selected = self.commands.profile.currentText().strip()
-            profiles = ["example-profile"] if self.demo else discover_profiles()
-            self.commands.profile.clear(); self.commands.profile.addItems(profiles)
-            completer = QCompleter(self.commands.profile.model(), self.commands.profile)
-            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-            completer.setFilterMode(Qt.MatchFlag.MatchContains)
-            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-            self.commands.profile.setCompleter(completer)
-            logger.info("AWS profiles discovered | count=%d", len(profiles))
-            if profiles:
-                self.commands.profile.setCurrentText(selected if selected in profiles else profiles[0])
-                self.sidebar.set_profile(self.commands.profile.currentText(),self.commands.region.currentText())
+            selected=self.commands.profile.currentText().strip(); profiles=["example-profile"] if self.demo else discover_profiles()
+            self.commands.profile.blockSignals(True); self.commands.profile.clear(); self.commands.profile.addItems(profiles); self.commands.profile.blockSignals(False)
+            completer=QCompleter(self.commands.profile.model(),self.commands.profile); completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive); completer.setFilterMode(Qt.MatchFlag.MatchContains); completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion); self.commands.profile.setCompleter(completer)
+            if profiles: self.commands.profile.setCurrentText(selected if selected in profiles else profiles[0])
+            self._context_changed()
+            self.context.setText(f"{len(profiles)} local AWS profile(s) available. Select one and connect.")
         except Exception as exc:
-            logger.exception("Failed to discover AWS profiles")
-            show_exception(self, "AWS profiles", "loading the available AWS profiles", exc)
-    def set_instances(self, instances):
-        logger.info("Updating fleet UI | instances=%d", len(instances))
-        self.instances=list(instances); self.fleet._filter_query = self.commands.search.text(); self.fleet.set_instances(self.instances); self.instancesChanged.emit(self.instances); self.metrics.set_value("instances",len(self.instances)); self.metrics.set_value("running",sum(i.state.lower()=="running" for i in self.instances))
-    def _profile_changed(self, profile):
-        """Changing context is intentionally local; Refresh performs AWS I/O."""
-        self.sidebar.set_profile(profile, self.commands.region.currentText())
-        if not self.demo:
-            self.set_instances([])
-            self.status.setText("◆  PROFILE CHANGED — REFRESH FLEET")
-    def _region_changed(self, region):
-        self.metrics.set_value("region", region)
-        self.sidebar.set_profile(self.commands.profile.currentText(), region)
-        if not self.demo:
-            self.set_instances([])
-            self.status.setText("◆  REGION CHANGED — REFRESH FLEET")
+            logger.exception("Failed to discover AWS profiles"); show_exception(self,"AWS profiles","loading the available AWS profiles",exc)
+    def _set_connecting(self, connecting):
+        self.commands.connect.setEnabled(not connecting); self.commands.validate.setEnabled(not connecting); self.commands.configure_profiles.setEnabled(not connecting); self.commands.refresh_profiles.setEnabled(not connecting)
+    def connect_aws(self):
+        if not self.terminal: return
+        profile=self.commands.profile.currentText().strip()
+        if not profile:
+            show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","No AWS profile is selected.","Select an AWS profile before continuing."); return
+        self._set_connecting(True); self.context.setText("Connecting to AWS and loading the EC2 fleet…"); self.terminal.load()
+    def fleet_loaded(self, count):
+        self._set_connecting(False); self.context.setText(f"AWS connected · {count} EC2 instance(s) loaded in Terminal."); self.connected.emit()
+    def fleet_failed(self):
+        self._set_connecting(False); self.context.setText("The AWS connection could not load the EC2 fleet. Review the error and retry.")
     def configure_profiles(self):
         if self.demo:
-            show_dialog(self, QMessageBox.Icon.Information, "AWS profile setup", "Profile configuration is unavailable in demo mode.")
-            return
-        dialog = AWSProfileSetupDialog(self, self.commands.region.currentText().strip() or DEFAULT_REGION)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        request = dialog.request()
-        self.commands.configure_profiles.setEnabled(False)
-        self.status.setText("●  CONFIGURING AWS PROFILES")
-        self.thread = QThread()
-        self.worker = Worker(lambda: bootstrap_sso_profiles(request))
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.profiles_configured)
-        self.worker.failed.connect(self.profile_setup_failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self.cleanup)
-        self.thread.start()
+            show_dialog(self,QMessageBox.Icon.Information,"AWS profile setup","Profile configuration is unavailable in demo mode."); return
+        dialog=AWSProfileSetupDialog(self,self.commands.region.currentText().strip() or DEFAULT_REGION)
+        if dialog.exec()!=QDialog.DialogCode.Accepted: return
+        self._set_connecting(True); self.context.setText("Configuring AWS profiles…"); self.thread=QThread(); self.worker=Worker(lambda:bootstrap_sso_profiles(dialog.request())); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self.profiles_configured); self.worker.failed.connect(self.profile_setup_failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
     @Slot(object)
-    def profiles_configured(self, result):
-        profiles = result.get("profiles", [])
-        self.load_profiles()
-        if profiles:
-            self.commands.profile.setCurrentText(profiles[0])
-        self.commands.configure_profiles.setEnabled(True)
-        self.status.setText("●  AWS PROFILES CONFIGURED")
-        show_dialog(self, QMessageBox.Icon.Information, "AWS profiles configured", f"Generated {len(profiles)} SSO profile(s).", f"Account used: {result.get('account_id', 'unknown')}\nConfig: {result.get('config_path', '')}\nBackups: {len(result.get('backups', []))}")
+    def profiles_configured(self,result):
+        profiles=result.get("profiles",[]); self.load_profiles()
+        if profiles: self.commands.profile.setCurrentText(profiles[0])
+        self._set_connecting(False); self.context.setText("AWS profiles configured. Select a profile and connect.")
+        show_dialog(self,QMessageBox.Icon.Information,"AWS profiles configured",f"Generated {len(profiles)} SSO profile(s).",f"Account used: {result.get('account_id','unknown')}\nConfig: {result.get('config_path','')}\nBackups: {len(result.get('backups',[]))}")
     @Slot(object)
-    def profile_setup_failed(self, exc):
-        self.commands.configure_profiles.setEnabled(True)
-        self.status.setText("◆  AWS PROFILE SETUP ERROR")
-        if not isinstance(exc, Exception): exc = RuntimeError(str(exc))
-        show_exception(self, "AWS profile setup failed", "validating credentials and generating AWS SSO profiles", exc)
+    def profile_setup_failed(self,exc):
+        self._set_connecting(False); self.context.setText("AWS profile setup failed. Review the details and retry.")
+        show_exception(self,"AWS profile setup failed","validating credentials and generating AWS SSO profiles",exc if isinstance(exc,Exception) else RuntimeError(str(exc)))
+    def validate_profile(self):
+        profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip() or DEFAULT_REGION
+        if not profile:
+            show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","No AWS profile is selected.","Select an AWS profile before continuing."); return
+        if self.demo:
+            show_dialog(self,QMessageBox.Icon.Information,"AWS validation","Demo mode is active; no AWS STS request was made."); return
+        self._set_connecting(True)
+        try:
+            identity=_run_with_sso(profile,lambda:get_caller_identity(profile,region)); account=identity.get("Account","unknown"); masked=f"••••{account[-4:]}" if account!="unknown" else "unknown"
+            self.context.setText("AWS session is valid. Loading the EC2 fleet…")
+            show_dialog(self,QMessageBox.Icon.Information,"AWS validation succeeded","The selected AWS session is valid. The EC2 fleet will now be loaded.",f"Account: {masked}\nARN: {identity.get('Arn','unknown')}\nRegion: {region}")
+            self.terminal.load()
+        except Exception as exc:
+            self._set_connecting(False); self.context.setText("AWS validation failed. Review the error and retry."); show_exception(self,"AWS validation failed","validating the selected AWS session",exc)
+    def cleanup(self):
+        if self.thread: self.thread.deleteLater(); self.thread=None
+        self.worker=None
+
+
+class PowerCon(BasePage):
+    instancesChanged = Signal(object)
+    def __init__(self, sidebar, commands, home, demo=False):
+        super().__init__(); self.sidebar=sidebar; self.commands=commands; self.home=home; self.demo=demo; self.instances=[]; self.thread=None
+        root=self.page_header("SECURE INSTANCE ACCESS / TERMINAL","Terminal","Manage the EC2 fleet for the AWS context selected on Home.","◆  DEMO MODE" if demo else "◆  WAITING FOR AWS CONNECTION")
+        rail=QFrame(); rail.setObjectName("commandRail"); rail_layout=QHBoxLayout(rail); rail_layout.setContentsMargins(18,12,18,12); rail_layout.setSpacing(16)
+        context=QVBoxLayout(); context.setSpacing(2); label=QLabel("ACTIVE AWS CONTEXT"); label.setObjectName("microLabel"); self.active_context=QLabel(); self.active_context.setObjectName("terminalContext"); context.addWidget(label); context.addWidget(self.active_context); rail_layout.addLayout(context)
+        rail_layout.addStretch(1); search=QVBoxLayout(); search.setSpacing(2); search_label=QLabel("FLEET SEARCH"); search_label.setObjectName("microLabel"); self.search=QLineEdit(); self.search.setPlaceholderText("Name, instance ID or private IP"); self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(320); search.addWidget(search_label); search.addWidget(self.search); rail_layout.addLayout(search)
+        self.open_sessions=QPushButton("OPEN SSM SESSIONS  →"); self.open_sessions.setObjectName("primaryButton"); self.open_sessions.setMinimumHeight(42); rail_layout.addWidget(self.open_sessions,0,Qt.AlignmentFlag.AlignBottom); root.addWidget(rail)
+        self.metrics=MetricStrip(); root.addWidget(self.metrics); self.fleet=FleetPanel(); root.addWidget(self.fleet,1)
+        footer=QHBoxLayout(); tip=QLabel("Select instances, then open their SSM sessions. Change AWS context on Home."); tip.setObjectName("footerText"); footer.addWidget(tip); footer.addStretch(); mark=QLabel("ARRAKIS  /  AWS"); mark.setObjectName("footerMark"); footer.addWidget(mark); root.addLayout(footer)
+        self.search.textChanged.connect(self.fleet.filter); self.fleet.selectionChanged.connect(lambda c:self.metrics.set_value("selected",c)); self.open_sessions.clicked.connect(self.connect_target); self.commands.region.currentTextChanged.connect(self._context_label); self.commands.profile.currentTextChanged.connect(self._context_label); self._context_label()
+        if demo: self.set_instances(demo_instances())
+    def _context_label(self, *_):
+        profile=self.commands.profile.currentText().strip() or "No profile selected"; region=self.commands.region.currentText().strip() or DEFAULT_REGION; self.active_context.setText(f"{profile}  ·  {region}"); self.metrics.set_value("region",region)
+    def context_changed(self):
+        self._context_label(); self.set_instances([]); self.status.setText("◆  CONTEXT CHANGED — CONNECT FROM HOME")
+    def set_instances(self,instances):
+        logger.info("Updating fleet UI | instances=%d",len(instances)); self.instances=list(instances); self.fleet._filter_query=self.search.text(); self.fleet.set_instances(self.instances); self.instancesChanged.emit(self.instances); self.metrics.set_value("instances",len(self.instances)); self.metrics.set_value("running",sum(i.state.lower()=="running" for i in self.instances))
     def load(self):
         profile=self.commands.profile.currentText().strip()
         if not profile:
@@ -651,39 +682,20 @@ class PowerCon(BasePage):
             return
         region=self.commands.region.currentText().strip()
         logger.info("Starting EC2 fleet load | profile=%r | region=%s | demo=%s", profile, region, self.demo)
-        self.commands.connect.setEnabled(False); self.commands.refresh.setEnabled(False); self.status.setText("●  QUERYING AWS"); logger.info("UI entered QUERYING AWS state")
+        self.open_sessions.setEnabled(False); self.status.setText("●  QUERYING AWS"); logger.info("UI entered QUERYING AWS state")
         self.thread=QThread(); self.worker=Worker(lambda: demo_instances() if self.demo else _run_with_sso(profile, lambda: list_instances(profile,region))); self.worker.moveToThread(self.thread); worker=self.worker
         self.thread.started.connect(worker.run); worker.finished.connect(self.loaded); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
     @Slot(object)
     def loaded(self, instances):
         logger.info("EC2 fleet loaded into UI | instances=%d", len(instances))
-        self.set_instances(instances); self.commands.connect.setEnabled(True); self.commands.refresh.setEnabled(True); self.status.setText("●  DEMO MODE" if self.demo else "●  AWS CONNECTED")
+        self.set_instances(instances); self.open_sessions.setEnabled(True); self.status.setText("●  DEMO MODE" if self.demo else "●  AWS CONNECTED"); self.home.fleet_loaded(len(self.instances))
     @Slot(object)
     def failed(self, exc):
         if not isinstance(exc, Exception):
             exc = RuntimeError(str(exc))
         logger.error("EC2 fleet load failed | %s: %s", type(exc).__name__, exc)
-        self.commands.connect.setEnabled(True); self.commands.refresh.setEnabled(True); self.status.setText("◆  AWS ERROR")
+        self.open_sessions.setEnabled(True); self.status.setText("◆  AWS ERROR"); self.home.fleet_failed()
         show_exception(self, "AWS error", "loading the EC2 fleet", exc)
-    def validate_profile(self):
-        profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip()
-        if not profile:
-            show_dialog(self, QMessageBox.Icon.Warning, "AWS profile", "No AWS profile is selected.", "Select an AWS profile before continuing.")
-            return
-        if self.demo:
-            self.status.setText("◆  DEMO SESSION VALID")
-            show_dialog(self, QMessageBox.Icon.Information, "AWS validation", "Demo mode is active; no AWS STS request was made.", "The application is using sample EC2 data. Switch to a real AWS profile to validate an AWS session.")
-            return
-        self.commands.validate.setEnabled(False)
-        try:
-            identity=_run_with_sso(profile, lambda: get_caller_identity(profile,region)); account=identity.get("Account","unknown"); masked=f"••••{account[-4:]}" if account!="unknown" else "unknown"; logger.info("AWS validation succeeded | profile=%r | region=%s", profile, region); self.status.setText("◆  AWS SESSION VALID")
-            show_dialog(self, QMessageBox.Icon.Information, "AWS validation succeeded", "The selected AWS session is valid. The EC2 fleet will now be loaded.", f"Account: {masked}\nARN: {identity.get('Arn','unknown')}\nRegion: {region}")
-            self.load()
-        except Exception as exc:
-            logger.exception("AWS validation failed | profile=%r | region=%s", profile, region)
-            self.status.setText("◆  AWS SESSION INVALID")
-            show_exception(self, "AWS validation failed", "validating the selected AWS session", exc)
-        finally: self.commands.validate.setEnabled(True)
     def cleanup(self):
         logger.info("AWS worker thread finished")
         if self.thread:
@@ -693,7 +705,7 @@ class PowerCon(BasePage):
     def connect_target(self):
         selected=self.fleet.selected_instances()
         if not selected:
-            self.load()
+            show_dialog(self,QMessageBox.Icon.Information,"Select EC2 targets","Select one or more EC2 instances before opening SSM sessions.","Use Home to change the AWS profile, region or reload the fleet.")
             return
         profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip()
         try:
@@ -1448,6 +1460,8 @@ QToolTip { background: #151b1c; color: #eee9df; border: 1px solid #3b3930; paddi
 #sideProfile { color: #c9c0ae; font-size: 10px; line-height: 1.4; }
 #sideStatus { color: #7ea67a; font-size: 9px; font-weight: 760; letter-spacing: 1.2px; margin-top: 5px; }
 #backdrop { background: #080a0b; }
+#homeContext { color: #c9c0ae; font-size: 11px; background: rgba(8,10,11,0.50); border: 1px solid rgba(199,165,106,0.16); border-radius: 6px; padding: 10px 16px; }
+#terminalContext { color: #d7d0c4; font-size: 11px; font-weight: 650; }
 #pageEyebrow { color: #777d79; font-size: 9px; font-weight: 760; letter-spacing: 2.1px; }
 #pageTitle { font-size: 31px; font-weight: 690; color: #eee9df; }
 #pageSubtitle { color: #8b918d; font-size: 11px; }
@@ -1826,10 +1840,11 @@ class FlowLogsPage(BasePage):
         self.flow_logs=inventory["flow_logs"]; self.interfaces=inventory["interfaces"]; self.vpc.blockSignals(True); self.vpc.clear()
         for item in inventory["vpcs"]:
             vpc_id=item.get("VpcId") or "Unknown VPC"
+            vpc_name=item.get("Name") or "unnamed VPC"
             eni_count=sum(1 for eni in self.interfaces if eni.get("VpcId")==item.get("VpcId"))
             vpc_logs=[log for log in self.flow_logs if log.get("VpcId")==item.get("VpcId")]
             cloudwatch_count=sum(1 for log in vpc_logs if str(log.get("DestinationType","")).casefold()=="cloud-watch-logs")
-            self.vpc.addItem(f"{vpc_id}  ·  {eni_count} interfaces  ·  {cloudwatch_count} CLOUDWATCH FLOW LOG(S)",item.get("VpcId"))
+            self.vpc.addItem(f"{vpc_id}  ·  {vpc_name}  ·  {eni_count} interfaces  ·  {cloudwatch_count} CLOUDWATCH FLOW LOG(S)",item.get("VpcId"))
         self.vpc.blockSignals(False)
         if self.vpc.count(): self.vpc.setCurrentIndex(0)
         self.discover.setEnabled(True); self._vpc_selected(); self.status.setText("●  VPC INVENTORY READY" if inventory["vpcs"] else "◆  NO VPCS"); self.context.setText(f"{len(inventory['vpcs'])} VPC(s) · {len(self.interfaces)} network interfaces discovered")
@@ -2669,16 +2684,22 @@ class LogViewer(QDialog):
 
 class MainWindow(QMainWindow):
     def __init__(self, demo=False):
-        super().__init__(); logger.info("Application window created | demo=%s", demo); self.setWindowTitle("SSM-SpiceConex · Arrakis Operations"); self.resize(1400,860); self.setMinimumSize(1120,720)
+        super().__init__(); logger.info("Application window created | demo=%s", demo); self.setWindowTitle("SpiceConex · Arrakis Operations"); self.resize(1400,860); self.setMinimumSize(1120,720)
         container=QWidget(); layout=QHBoxLayout(container); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0); self.setCentralWidget(container)
         self.sidebar=Sidebar(); layout.addWidget(self.sidebar); self.stack=QStackedWidget(); layout.addWidget(self.stack,1)
-        self.power=PowerCon(self.sidebar,demo); self.tunnel=Tunneling(self.power); self.command=CommandPage(self.power); self.performance=PerformancePage(self.power); self.connectivity=ConnectivityPage(self.power); self.flow_logs=FlowLogsPage(self.power); self.certificates=CertificatesPage(self.power); self.architecture=ArchitecturePage(self.power,demo)
-        for page in (self.power,self.tunnel,self.command,self.performance,self.connectivity,self.flow_logs,self.certificates,self.architecture): self.stack.addWidget(page)
+        self.home=HomePage(self.sidebar,demo); self.power=PowerCon(self.sidebar,self.home.commands,self.home,demo); self.home.set_terminal(self.power); self.tunnel=Tunneling(self.power); self.command=CommandPage(self.power); self.performance=PerformancePage(self.power); self.connectivity=ConnectivityPage(self.power); self.flow_logs=FlowLogsPage(self.power); self.certificates=CertificatesPage(self.power); self.architecture=ArchitecturePage(self.power,demo)
+        for page in (self.home,self.power,self.tunnel,self.command,self.performance,self.connectivity,self.flow_logs,self.certificates,self.architecture): self.stack.addWidget(page)
         self.sidebar.pageRequested.connect(self.stack.setCurrentIndex)
+        self.stack.currentChanged.connect(self.sidebar.set_current_page)
+        self.home.connected.connect(self.show_terminal)
         logs_action = QAction(self); logs_action.setShortcut(QKeySequence("Ctrl+L")); logs_action.triggered.connect(lambda: LogViewer(self).exec()); self.addAction(logs_action)
         self.sidebar.update_button.clicked.connect(self.check_updates)
         self.update_thread = None
         self.update_worker = None
+
+    def show_terminal(self):
+        self.stack.setCurrentIndex(1)
+        self.sidebar.buttons[1].setChecked(True)
 
     def check_updates(self):
         if self.update_thread is not None:

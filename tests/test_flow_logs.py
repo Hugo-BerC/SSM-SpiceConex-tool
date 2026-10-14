@@ -53,6 +53,17 @@ class FlowLogTests(unittest.TestCase):
         self.assertEqual("eni-covered", page.interface.currentData()["InterfaceId"])
         self.assertEqual("eni-covered", page.selected_flow_log["ResourceId"])
 
+    def test_vpc_selector_includes_the_aws_name_tag(self):
+        profile, region = QComboBox(), QComboBox()
+        profile.addItem("engineering"); region.addItem("eu-west-1")
+        page = FlowLogsPage(SimpleNamespace(commands=SimpleNamespace(profile=profile, region=region)))
+        page._logs_loaded({
+            "vpcs": [{"VpcId": "vpc-123", "Name": "payments-production"}],
+            "interfaces": [],
+            "flow_logs": [],
+        })
+        self.assertIn("vpc-123  ·  payments-production", page.vpc.itemText(0))
+
     def test_inventory_unpacks_vpcs_from_the_ec2_paginator_page(self):
         class Paginator:
             def __init__(self, pages): self.pages = pages
@@ -61,7 +72,7 @@ class FlowLogTests(unittest.TestCase):
             def get_paginator(self, name):
                 pages = {
                     "describe_network_interfaces": [{"NetworkInterfaces": [{"VpcId": "vpc-123", "NetworkInterfaceId": "eni-123", "PrivateIpAddress": "10.0.1.9"}]}],
-                    "describe_vpcs": [{"Vpcs": [{"VpcId": "vpc-123", "CidrBlockAssociationSet": [{"CidrBlock": "10.0.0.0/16"}]}]}],
+                    "describe_vpcs": [{"Vpcs": [{"VpcId": "vpc-123", "Tags": [{"Key": "Name", "Value": "payments-production"}], "CidrBlockAssociationSet": [{"CidrBlock": "10.0.0.0/16"}]}]}],
                     "describe_subnets": [{"Subnets": []}],
                     "describe_flow_logs": [{"FlowLogs": [{"FlowLogId": "fl-123", "ResourceId": "vpc-123", "LogDestinationType": "s3"}]}],
                 }
@@ -69,6 +80,7 @@ class FlowLogTests(unittest.TestCase):
         with patch("services.flow_logs.get_ec2_client", return_value=Ec2()):
             inventory = discover_vpc_flow_inventory("profile", "eu-west-1")
         self.assertEqual("vpc-123", inventory["vpcs"][0]["VpcId"])
+        self.assertEqual("payments-production", inventory["vpcs"][0]["Name"])
         self.assertEqual("vpc-123", inventory["interfaces"][0]["VpcId"])
         self.assertEqual("vpc-123", inventory["flow_logs"][0]["VpcId"])
 
