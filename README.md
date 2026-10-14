@@ -23,10 +23,9 @@ The architecture discovery module builds a deterministic AWS resource graph firs
 
 **Update channel:** `main` (Git)
 
-> The in-app updater is intentionally conservative: it only accepts published semantic-version Git tags, refuses to overwrite local changes, prepares Python dependencies before changing source files, and restarts SpiceConex.
+> The in-app updater is intentionally conservative: it only accepts  semantic-version Git tags, refuses to overwrite local changes, prepares Python dependencies before changing source files, and restarts SpiceConex.
 
-## Installation
-
+## Installati
 The bootstrapper detects the host platform and installs the local tooling required by SpiceConex:
 
 - Python 3.10+
