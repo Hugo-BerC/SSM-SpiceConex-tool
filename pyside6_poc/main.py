@@ -4,17 +4,18 @@ import argparse
 import os
 import sys
 import csv
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot, QPointF, QUrl
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot, QPointF, QUrl, QDateTime, QTimeZone
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QImage, QLinearGradient, QRadialGradient, QKeySequence, QAction, QDesktopServices, QIcon, QPolygonF, QPen, QPainterPath
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QCompleter, QFrame, QGraphicsDropShadowEffect,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QStackedWidget, QTabWidget, QToolButton, QVBoxLayout, QWidget,
-    QPlainTextEdit, QFileDialog, QDialog, QGridLayout, QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QPlainTextEdit, QFileDialog, QDialog, QGridLayout, QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QDateTimeEdit,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsLineItem, QGraphicsPathItem,
 )
 
@@ -25,6 +26,7 @@ from aws.identity import get_caller_identity
 from aws.sso import login_profile
 from aws.session import clear_session_cache
 from aws.profiles import discover_profiles
+from aws.profile_setup import ProfileSetupRequest, bootstrap_sso_profiles
 from models.instance import EC2Instance
 from terminal.platform import open_command
 from services.ssm_commands import build_port_forward_command, build_start_session_command, validate_port
@@ -32,6 +34,7 @@ from services.ssm import send_command
 from services.ebs import list_instance_volumes, create_cloudwatch_dashboard
 from services.performance import calculate_baseline
 from services.connectivity import parse_connectivity_csv, validate_connectivity_csv
+from services.flow_logs import analyse_flow_log, discover_vpc_flow_inventory
 from services.certificates import (
     BALANCER_COLUMNS, CERTIFICATE_COLUMNS, discover_certificate_inventory,
 )
@@ -200,7 +203,7 @@ class Sidebar(QFrame):
         layout.addSpacing(8)
 
         self.buttons = []
-        entries = [("◆", "TERMINAL"), ("◇", "TUNNELING"), ("◇", "COMMAND"), ("◇", "PERFORMANCE"), ("◇", "CONNECTIVITY"), ("◇", "CERTIFICATES"), ("◇", "ARCHITECTURE")]
+        entries = [("◆", "TERMINAL"), ("◇", "TUNNELING"), ("◇", "COMMAND"), ("◇", "PERFORMANCE"), ("◇", "CONNECTIVITY"), ("◇", "FLOW LOGS"), ("◇", "CERTIFICATES"), ("◇", "ARCHITECTURE")]
         for index, (glyph, title) in enumerate(entries):
             button = QToolButton(); button.setText(f"{glyph}   {title}"); button.setCheckable(True); button.setAutoExclusive(True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly); button.setObjectName("navButton")
@@ -248,13 +251,14 @@ class CommandRail(QFrame):
         self.region = QComboBox(); self.region.setEditable(True); self.region.addItems(["us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-southeast-1"])
         self.region.setCurrentText(DEFAULT_REGION)
         region.addWidget(region_label); region.addWidget(self.region); layout.addLayout(region)
-        self.refresh = QPushButton("↻  REFRESH"); self.refresh.setObjectName("quietButton"); self.refresh.setMinimumHeight(42); layout.addWidget(self.refresh, 0, Qt.AlignmentFlag.AlignBottom)
+        self.refresh = QPushButton("↻  REFRESH"); self.refresh.setObjectName("quietButton"); self.refresh.setMinimumHeight(42); self.refresh.setToolTip("Load the EC2 fleet for the selected AWS profile and region"); layout.addWidget(self.refresh, 0, Qt.AlignmentFlag.AlignBottom)
         self.validate = QPushButton("✓  VALIDATE"); self.validate.setObjectName("quietButton"); self.validate.setMinimumHeight(42); layout.addWidget(self.validate, 0, Qt.AlignmentFlag.AlignBottom)
         layout.addStretch(1)
         search = QVBoxLayout(); search.setSpacing(2); search_label = QLabel("FLEET SEARCH"); search_label.setObjectName("microLabel")
         self.search = QLineEdit(); self.search.setPlaceholderText("Name, instance ID or private IP"); self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(320)
         search.addWidget(search_label); search.addWidget(self.search); layout.addLayout(search)
         self.connect = QPushButton("CONNECT  →"); self.connect.setObjectName("primaryButton"); self.connect.setMinimumHeight(42); layout.addWidget(self.connect, 0, Qt.AlignmentFlag.AlignBottom)
+        self.configure_profiles = QToolButton(); self.configure_profiles.setText("⚙"); self.configure_profiles.setObjectName("quietButton"); self.configure_profiles.setToolTip("Configure or regenerate AWS profiles"); self.configure_profiles.setFixedSize(42,42); layout.addWidget(self.configure_profiles, 0, Qt.AlignmentFlag.AlignBottom)
         shadow(self, 24, 7, 55)
 
 
@@ -436,6 +440,131 @@ def _run_with_sso(profile: str, operation):
         return operation()
 
 
+def _discover_certificates_for_profiles(profiles: list[str], region: str) -> dict:
+    """Collect certificate inventories while keeping one failing account isolated.
+
+    A single account must retain the existing behaviour (including the automatic
+    SSO refresh).  The all-accounts mode deliberately continues after a failed
+    profile so an expired or unauthorized account does not hide inventory from
+    every other selected account.
+    """
+    selected_profiles = list(dict.fromkeys(profile.strip() for profile in profiles if profile.strip()))
+    if not selected_profiles:
+        raise ValueError("No AWS profiles are available for certificate discovery.")
+
+    certificates: list[dict] = []
+    balancers: list[dict] = []
+    inventories: list[dict] = []
+    failures: list[dict] = []
+    for profile in selected_profiles:
+        try:
+            inventory = _run_with_sso(
+                profile,
+                lambda profile=profile: discover_certificate_inventory(profile, region),
+            )
+        except Exception as exc:
+            logger.warning("Certificate discovery skipped profile %r: %s", profile, exc)
+            failures.append({"profile": profile, "error": str(exc) or exc.__class__.__name__})
+            continue
+        inventories.append(inventory)
+        certificates.extend(inventory.get("certificates", []))
+        balancers.extend(inventory.get("balancers", []))
+
+    return {
+        "profiles": selected_profiles,
+        "inventories": inventories,
+        "failures": failures,
+        "certificates": certificates,
+        "balancers": balancers,
+        "region": region,
+    }
+
+
+class AWSProfileSetupDialog(QDialog):
+    """GUI replacement for the AWS Organizations profile bootstrap script."""
+
+    def __init__(self, parent=None, default_region=DEFAULT_REGION):
+        super().__init__(parent)
+        self.setWindowTitle("Configure AWS SSO profiles")
+        self.setModal(True)
+        self.setMinimumWidth(590)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+        title = QLabel("CONFIGURE AWS ORGANIZATIONS PROFILES")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+        help_text = QLabel(
+            "Validate an account with organizations:ListAccounts, then generate one IAM Identity Center profile per AWS account. "
+            "Existing AWS config and credentials files are backed up before they are replaced."
+        )
+        help_text.setObjectName("tunnelInfo")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        self.region = self._field(form, 0, "DEFAULT REGION", default_region)
+        self.sso_start_url = self._field(form, 1, "SSO START URL", placeholder="https://d-xxxxxxxxxx.awsapps.com/start")
+        self.sso_region = self._field(form, 2, "SSO REGION", default_region)
+        self.sso_role_name = self._field(form, 3, "SSO ROLE NAME", "AWSAdministratorAccess")
+        self.access_key_id = self._field(form, 4, "ACCESS KEY ID")
+        self.secret_access_key = self._field(form, 5, "SECRET ACCESS KEY", secret=True)
+        self.session_token = self._field(form, 6, "SESSION TOKEN (ASIA KEYS ONLY)", secret=True)
+        layout.addLayout(form)
+
+        note = QLabel("Credentials are used only for validation and the Organizations query. They are not written to application logs.")
+        note.setObjectName("footerText")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("CANCEL")
+        cancel.setObjectName("quietButton")
+        cancel.clicked.connect(self.reject)
+        self.accept_button = QPushButton("GENERATE PROFILES  →")
+        self.accept_button.setObjectName("primaryButton")
+        self.accept_button.clicked.connect(self._validate_and_accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.accept_button)
+        layout.addLayout(buttons)
+
+    @staticmethod
+    def _field(layout, row, label, default="", placeholder="", secret=False):
+        caption = QLabel(label)
+        caption.setObjectName("microLabel")
+        field = QLineEdit(default)
+        field.setPlaceholderText(placeholder)
+        if secret:
+            field.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(caption, row, 0)
+        layout.addWidget(field, row, 1)
+        return field
+
+    def request(self) -> ProfileSetupRequest:
+        return ProfileSetupRequest(
+            region=self.region.text().strip(),
+            sso_start_url=self.sso_start_url.text().strip(),
+            sso_region=self.sso_region.text().strip(),
+            sso_role_name=self.sso_role_name.text().strip(),
+            access_key_id=self.access_key_id.text().strip(),
+            secret_access_key=self.secret_access_key.text(),
+            session_token=self.session_token.text(),
+        )
+
+    def _validate_and_accept(self):
+        request = self.request()
+        required = (request.region, request.sso_start_url, request.sso_region, request.sso_role_name, request.access_key_id, request.secret_access_key)
+        if not all(value.strip() for value in required):
+            show_dialog(self, QMessageBox.Icon.Warning, "AWS profile setup", "Complete all required fields before continuing.")
+            return
+        if request.access_key_id.upper().startswith("ASIA") and not request.session_token.strip():
+            show_dialog(self, QMessageBox.Icon.Warning, "AWS profile setup", "Temporary ASIA credentials require an AWS Session Token.")
+            return
+        self.accept()
+
+
 class PowerCon(BasePage):
     instancesChanged = Signal(object)
     def __init__(self, sidebar, demo=False):
@@ -443,13 +572,14 @@ class PowerCon(BasePage):
         root = self.page_header("SECURE INSTANCE ACCESS / TERMINAL", "Terminal", "Control access to your EC2 fleet from one operational surface.", "◆  DEMO MODE" if demo else "◆  READY")
         self.commands=CommandRail(); root.addWidget(self.commands); self.metrics=MetricStrip(); root.addWidget(self.metrics); self.fleet=FleetPanel(); root.addWidget(self.fleet,1)
         footer=QHBoxLayout(); tip=QLabel("COMMAND PALETTE    CTRL + K"); tip.setObjectName("footerText"); footer.addWidget(tip); footer.addStretch(); mark=QLabel("ARRAKIS  /  AWS"); mark.setObjectName("footerMark"); footer.addWidget(mark); root.addLayout(footer)
-        self.commands.refresh.clicked.connect(self.load); self.commands.validate.clicked.connect(self.validate_profile); self.commands.search.textChanged.connect(self.fleet.filter)
-        self.commands.region.currentTextChanged.connect(lambda v:self.metrics.set_value("region",v)); self.commands.profile.currentTextChanged.connect(lambda v:self.sidebar.set_profile(v,self.commands.region.currentText()))
+        self.commands.configure_profiles.clicked.connect(self.configure_profiles); self.commands.refresh.clicked.connect(self.load); self.commands.validate.clicked.connect(self.validate_profile); self.commands.search.textChanged.connect(self.fleet.filter)
+        self.commands.region.currentTextChanged.connect(self._region_changed); self.commands.profile.currentTextChanged.connect(self._profile_changed)
         self.fleet.selectionChanged.connect(lambda c:self.metrics.set_value("selected",c)); self.commands.connect.clicked.connect(self.connect_target); self.load_profiles()
         if demo: self.set_instances(demo_instances())
     def load_profiles(self):
         logger.info("Loading AWS profiles")
         try:
+            selected = self.commands.profile.currentText().strip()
             profiles = ["example-profile"] if self.demo else discover_profiles()
             self.commands.profile.clear(); self.commands.profile.addItems(profiles)
             completer = QCompleter(self.commands.profile.model(), self.commands.profile)
@@ -458,13 +588,62 @@ class PowerCon(BasePage):
             completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
             self.commands.profile.setCompleter(completer)
             logger.info("AWS profiles discovered | count=%d", len(profiles))
-            if profiles: self.commands.profile.setCurrentIndex(0); self.sidebar.set_profile(profiles[0],self.commands.region.currentText())
+            if profiles:
+                self.commands.profile.setCurrentText(selected if selected in profiles else profiles[0])
+                self.sidebar.set_profile(self.commands.profile.currentText(),self.commands.region.currentText())
         except Exception as exc:
             logger.exception("Failed to discover AWS profiles")
             show_exception(self, "AWS profiles", "loading the available AWS profiles", exc)
     def set_instances(self, instances):
         logger.info("Updating fleet UI | instances=%d", len(instances))
         self.instances=list(instances); self.fleet._filter_query = self.commands.search.text(); self.fleet.set_instances(self.instances); self.instancesChanged.emit(self.instances); self.metrics.set_value("instances",len(self.instances)); self.metrics.set_value("running",sum(i.state.lower()=="running" for i in self.instances))
+    def _profile_changed(self, profile):
+        """Changing context is intentionally local; Refresh performs AWS I/O."""
+        self.sidebar.set_profile(profile, self.commands.region.currentText())
+        if not self.demo:
+            self.set_instances([])
+            self.status.setText("◆  PROFILE CHANGED — REFRESH FLEET")
+    def _region_changed(self, region):
+        self.metrics.set_value("region", region)
+        self.sidebar.set_profile(self.commands.profile.currentText(), region)
+        if not self.demo:
+            self.set_instances([])
+            self.status.setText("◆  REGION CHANGED — REFRESH FLEET")
+    def configure_profiles(self):
+        if self.demo:
+            show_dialog(self, QMessageBox.Icon.Information, "AWS profile setup", "Profile configuration is unavailable in demo mode.")
+            return
+        dialog = AWSProfileSetupDialog(self, self.commands.region.currentText().strip() or DEFAULT_REGION)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        request = dialog.request()
+        self.commands.configure_profiles.setEnabled(False)
+        self.status.setText("●  CONFIGURING AWS PROFILES")
+        self.thread = QThread()
+        self.worker = Worker(lambda: bootstrap_sso_profiles(request))
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.finished.connect(self.profiles_configured)
+        self.worker.failed.connect(self.profile_setup_failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.cleanup)
+        self.thread.start()
+    @Slot(object)
+    def profiles_configured(self, result):
+        profiles = result.get("profiles", [])
+        self.load_profiles()
+        if profiles:
+            self.commands.profile.setCurrentText(profiles[0])
+        self.commands.configure_profiles.setEnabled(True)
+        self.status.setText("●  AWS PROFILES CONFIGURED")
+        show_dialog(self, QMessageBox.Icon.Information, "AWS profiles configured", f"Generated {len(profiles)} SSO profile(s).", f"Account used: {result.get('account_id', 'unknown')}\nConfig: {result.get('config_path', '')}\nBackups: {len(result.get('backups', []))}")
+    @Slot(object)
+    def profile_setup_failed(self, exc):
+        self.commands.configure_profiles.setEnabled(True)
+        self.status.setText("◆  AWS PROFILE SETUP ERROR")
+        if not isinstance(exc, Exception): exc = RuntimeError(str(exc))
+        show_exception(self, "AWS profile setup failed", "validating credentials and generating AWS SSO profiles", exc)
     def load(self):
         profile=self.commands.profile.currentText().strip()
         if not profile:
@@ -472,19 +651,19 @@ class PowerCon(BasePage):
             return
         region=self.commands.region.currentText().strip()
         logger.info("Starting EC2 fleet load | profile=%r | region=%s | demo=%s", profile, region, self.demo)
-        self.commands.refresh.setEnabled(False); self.status.setText("●  QUERYING AWS"); logger.info("UI entered QUERYING AWS state")
+        self.commands.connect.setEnabled(False); self.commands.refresh.setEnabled(False); self.status.setText("●  QUERYING AWS"); logger.info("UI entered QUERYING AWS state")
         self.thread=QThread(); self.worker=Worker(lambda: demo_instances() if self.demo else _run_with_sso(profile, lambda: list_instances(profile,region))); self.worker.moveToThread(self.thread); worker=self.worker
         self.thread.started.connect(worker.run); worker.finished.connect(self.loaded); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
     @Slot(object)
     def loaded(self, instances):
         logger.info("EC2 fleet loaded into UI | instances=%d", len(instances))
-        self.set_instances(instances); self.commands.refresh.setEnabled(True); self.status.setText("●  DEMO MODE" if self.demo else "●  AWS CONNECTED")
+        self.set_instances(instances); self.commands.connect.setEnabled(True); self.commands.refresh.setEnabled(True); self.status.setText("●  DEMO MODE" if self.demo else "●  AWS CONNECTED")
     @Slot(object)
     def failed(self, exc):
         if not isinstance(exc, Exception):
             exc = RuntimeError(str(exc))
         logger.error("EC2 fleet load failed | %s: %s", type(exc).__name__, exc)
-        self.commands.refresh.setEnabled(True); self.status.setText("◆  AWS ERROR")
+        self.commands.connect.setEnabled(True); self.commands.refresh.setEnabled(True); self.status.setText("◆  AWS ERROR")
         show_exception(self, "AWS error", "loading the EC2 fleet", exc)
     def validate_profile(self):
         profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip()
@@ -514,7 +693,7 @@ class PowerCon(BasePage):
     def connect_target(self):
         selected=self.fleet.selected_instances()
         if not selected:
-            show_dialog(self, QMessageBox.Icon.Warning, "No targets selected", "No EC2 instances are selected for the terminal session.", "Select one or more instances in the EC2 fleet and then press CONNECT.")
+            self.load()
             return
         profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip()
         try:
@@ -679,6 +858,8 @@ class FilterableTable(QFrame):
         self.sort_column = -1
         self.sort_order = Qt.SortOrder.AscendingOrder
         self.filter_options = filter_options or {}
+        self.row_predicate = None
+        self._rendered_rows = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -755,6 +936,11 @@ class FilterableTable(QFrame):
         self.sort_order = Qt.SortOrder.AscendingOrder
         self._render()
 
+    def set_row_predicate(self, predicate):
+        """Apply page-level facets while retaining the visible column filters."""
+        self.row_predicate = predicate
+        self._render()
+
     def clear_filters(self):
         changed = False
         for control in self.filters:
@@ -778,6 +964,8 @@ class FilterableTable(QFrame):
         return control.text().strip()
 
     def _matches(self, row):
+        if self.row_predicate and not self.row_predicate(row):
+            return False
         for control, key in zip(self.filters, self.keys):
             value = self._filter_value(control)
             if value in (None, ""):
@@ -824,7 +1012,8 @@ class FilterableTable(QFrame):
 
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(0)
-        for row in rows:
+        self._rendered_rows = list(rows)
+        for source_index, row in enumerate(rows):
             index = self.table.rowCount()
             self.table.insertRow(index)
             for column, key in enumerate(self.keys):
@@ -832,6 +1021,7 @@ class FilterableTable(QFrame):
                 if isinstance(value, bool):
                     value = "YES" if value else "NO"
                 item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, source_index)
                 if key in {"Status", "CertStatus"}:
                     status = str(value).upper()
                     if status == "ISSUED":
@@ -853,6 +1043,13 @@ class FilterableTable(QFrame):
     def count_text(self, label):
         visible = self.table.rowCount()
         return f"{visible} / {len(self.rows)} {label}"
+
+    def selected_row(self):
+        item = self.table.currentItem()
+        if not item:
+            return None
+        index = item.data(Qt.ItemDataRole.UserRole)
+        return self._rendered_rows[index] if isinstance(index, int) and 0 <= index < len(self._rendered_rows) else None
 
 
 class CertificatesPage(BasePage):
@@ -884,6 +1081,13 @@ class CertificatesPage(BasePage):
         context.addWidget(label)
         context.addWidget(self.context)
         form.addLayout(context, 1)
+        self.all_accounts = QCheckBox("ALL AWS ACCOUNTS")
+        self.all_accounts.setObjectName("allAccountsToggle")
+        self.all_accounts.setToolTip(
+            "Discover certificates for every AWS profile configured in Terminal. "
+            "A failed account will not stop the other accounts."
+        )
+        form.addWidget(self.all_accounts)
         self.discover = QPushButton("DISCOVER  →")
         self.discover.setObjectName("primaryButton")
         self.discover.setMinimumHeight(42)
@@ -949,6 +1153,7 @@ class CertificatesPage(BasePage):
         root.addWidget(self.tabs, 1)
 
         self.discover.clicked.connect(self.run_discovery)
+        self.all_accounts.toggled.connect(lambda _enabled: self._update_context())
         self.source.commands.profile.currentTextChanged.connect(lambda _value: self._update_context())
         self.source.commands.region.currentTextChanged.connect(lambda _value: self._update_context())
         self._update_context()
@@ -956,6 +1161,9 @@ class CertificatesPage(BasePage):
     def _update_context(self):
         profile = self.source.commands.profile.currentText().strip()
         region = self.source.commands.region.currentText().strip() or DEFAULT_REGION
+        if self.all_accounts.isChecked():
+            self.context.setText(f"All configured AWS accounts  ·  {region}")
+            return
         if profile:
             self.context.setText(f"{profile}  ·  {region}")
         else:
@@ -964,7 +1172,8 @@ class CertificatesPage(BasePage):
     def run_discovery(self):
         profile = self.source.commands.profile.currentText().strip()
         region = self.source.commands.region.currentText().strip()
-        if not profile:
+        all_accounts = self.all_accounts.isChecked()
+        if not profile and not all_accounts:
             show_dialog(
                 self,
                 QMessageBox.Icon.Warning,
@@ -983,12 +1192,25 @@ class CertificatesPage(BasePage):
             )
             return
 
+        profiles = discover_profiles() if all_accounts else [profile]
+        if not profiles:
+            show_dialog(
+                self,
+                QMessageBox.Icon.Warning,
+                "No AWS accounts available",
+                "No configured AWS profiles were found.",
+                "Configure at least one AWS profile in Terminal and retry the discovery.",
+            )
+            return
+
         self._update_context()
         self.discover.setEnabled(False)
-        self.summary.setText(f"Discovering ACM and ALB/NLB resources in {region}…")
+        self.all_accounts.setEnabled(False)
+        scope = f"{len(profiles)} AWS accounts" if all_accounts else profile
+        self.summary.setText(f"Discovering ACM and ALB/NLB resources for {scope} in {region}…")
         self.status.setText("●  QUERYING AWS")
         self.thread = QThread()
-        self.worker = Worker(lambda: _run_with_sso(profile, lambda: discover_certificate_inventory(profile, region)))
+        self.worker = Worker(lambda: _discover_certificates_for_profiles(profiles, region))
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self.finished)
@@ -1007,11 +1229,18 @@ class CertificatesPage(BasePage):
         self.lb_table.set_rows(balancers)
         self.cert_count.setText(self.cert_table.count_text("certificates"))
         self.lb_count.setText(self.lb_table.count_text("correlation rows"))
+        selected = len(inventory.get("profiles", []))
+        completed = len(inventory.get("inventories", []))
+        failures = inventory.get("failures", [])
+        account_label = "account" if selected == 1 else "accounts"
         self.summary.setText(
-            f"Account {inventory.get('account_id', 'unknown')} · {len(certificates)} certificates · {len(balancers)} ALB/NLB correlation rows · Region {inventory.get('region', '')}"
+            f"{completed}/{selected} {account_label} discovered · {len(certificates)} certificates · "
+            f"{len(balancers)} ALB/NLB correlation rows · Region {inventory.get('region', '')}"
+            + (f" · {len(failures)} account(s) skipped" if failures else "")
         )
-        self.status.setText("●  INVENTORY READY")
+        self.status.setText("◆  INVENTORY PARTIAL" if failures else "●  INVENTORY READY")
         self.discover.setEnabled(True)
+        self.all_accounts.setEnabled(True)
         logger.info(
             "Certificates UI updated | certificates=%d | balancer_rows=%d",
             len(certificates), len(balancers),
@@ -1024,6 +1253,7 @@ class CertificatesPage(BasePage):
         self.status.setText("◆  AWS ERROR")
         self.summary.setText("Certificate discovery failed.")
         self.discover.setEnabled(True)
+        self.all_accounts.setEnabled(True)
         logger.error("Certificate discovery failed | %s: %s", type(exc).__name__, exc)
         show_exception(
             self,
@@ -1502,6 +1732,209 @@ QTableCornerButton::section {
 #columnFilterCombo::down-arrow { image: none; width: 5px; height: 5px; border-right: 1px solid #c7a56a; border-bottom: 1px solid #c7a56a; margin-right: 8px; }
 #columnFilterCombo QAbstractItemView { background: #101516; border: 1px solid #4a3529; selection-background-color: #352217; selection-color: #d47a3f; padding: 5px; outline: 0; }
 """
+
+
+class FlowLogMap(QGraphicsView):
+    """Compact directional view of aggregated VPC Flow Log groups."""
+    def __init__(self, parent=None):
+        super().__init__(parent); self.scene = QGraphicsScene(self); self.setScene(self.scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing); self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setBackgroundBrush(QColor(9, 13, 14)); self.setMinimumHeight(430)
+    def wheelEvent(self, event):
+        factor = 1.16 if event.angleDelta().y() > 0 else 1 / 1.16; self.scale(factor, factor)
+    def render_rows(self, vpc_id, rows, interface=None):
+        self.scene.clear()
+        if not rows:
+            hint=self.scene.addText("Run an analysis to render grouped inbound and outbound VPC connections."); hint.setDefaultTextColor(QColor(MUTED)); hint.setPos(28,28); self.scene.setSceneRect(0,0,940,430); return
+        shown=sorted(rows, key=lambda row: row.get("Observations", 0), reverse=True)[:60]
+        center_x, center_y, width, height = 475, 245, 240, 98
+        core=self.scene.addRect(center_x-width/2, center_y-height/2, width, height); core.setBrush(QColor(25,32,31)); core.setPen(QPen(QColor(SPICE),2))
+        interface = interface or {}
+        title=self.scene.addText("SELECTED ENI"); title.setDefaultTextColor(QColor(SAND)); title.setFont(QFont("Segoe UI",8,QFont.Weight.Bold)); title.setPos(center_x-93,center_y-31)
+        label=self.scene.addText(interface.get("InterfaceId") or vpc_id); label.setDefaultTextColor(QColor(TEXT)); label.setFont(QFont("Segoe UI",11,QFont.Weight.DemiBold)); label.setPos(center_x-93,center_y-6)
+        ip_label=self.scene.addText(interface.get("PrivateIp") or vpc_id); ip_label.setDefaultTextColor(QColor(MUTED)); ip_label.setFont(QFont("Segoe UI",8)); ip_label.setPos(center_x-93,center_y+18)
+        groups={"INBOUND":[],"OUTBOUND":[],"INTERNAL":[],"TRANSIT":[]}
+        for row in shown: groups.get(row.get("Direction"), groups["TRANSIT"]).append(row)
+        columns=[("INBOUND",35,"INBOUND ORIGINS",lambda row: row["Origin"], True), ("OUTBOUND",700,"OUTBOUND DESTINATIONS",lambda row: row["Destination"], False)]
+        for direction, x, heading, endpoint, inbound in columns:
+            text=self.scene.addText(heading); text.setDefaultTextColor(QColor(SAND)); text.setFont(QFont("Segoe UI",8,QFont.Weight.Bold)); text.setPos(x,22)
+            for index,row in enumerate(groups[direction][:20]):
+                y=72+index*72; result=row.get("Result",""); color=QColor(GREEN if result=="ACCEPT" else RED)
+                source_x=center_x-width/2 if inbound else center_x+width/2; target_x=x+205 if inbound else x
+                line=QGraphicsLineItem(target_x,y+23,source_x,center_y); line.setPen(QPen(color,1.5)); line.setZValue(-1); line.setToolTip(f"{row['Origin']} → {row['Destination']} · {row['Protocol']}:{row['Port']} · {result} · {row['Observations']} grouped events"); self.scene.addItem(line)
+                card=self.scene.addRect(x,y,205,46); card.setBrush(QColor(20,25,26)); card.setPen(QPen(color,1)); card.setToolTip(line.toolTip())
+                ep=self.scene.addText(str(endpoint(row))[:25]); ep.setDefaultTextColor(QColor(TEXT)); ep.setFont(QFont("Segoe UI",8,QFont.Weight.DemiBold)); ep.setPos(x+8,y+6)
+                detail=self.scene.addText(f"{row['Protocol']}:{row['Port']} · {result}"); detail.setDefaultTextColor(color); detail.setFont(QFont("Segoe UI",7)); detail.setPos(x+8,y+25)
+        internal=self.scene.addText(f"Internal / transit grouped paths: {len(groups['INTERNAL']) + len(groups['TRANSIT'])}  ·  Showing top {len(shown)} filtered paths by observed flow records")
+        internal.setDefaultTextColor(QColor(MUTED)); internal.setFont(QFont("Segoe UI",8)); internal.setPos(28,405)
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-25,-20,25,30)); self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+    def export_png(self, parent):
+        if self.scene.sceneRect().isNull() or not self.scene.items(): return False
+        path=_save_png_dialog(parent,"Export VPC flow map","vpc-flow-map.png")
+        if not path: return False
+        rect=self.scene.sceneRect().adjusted(-20,-20,20,20); image=QImage(max(1,int(rect.width()*2)),max(1,int(rect.height()*2)),QImage.Format.Format_ARGB32); image.fill(QColor(9,13,14)); painter=QPainter(image); self.scene.render(painter,image.rect().toRectF(),rect); painter.end()
+        if not image.save(path): show_dialog(parent,QMessageBox.Icon.Warning,"PNG export","The VPC flow map could not be saved."); return False
+        return True
+
+
+def _save_png_dialog(parent, title, default_name):
+    dialog=QFileDialog(parent,title,str(Path.home()/default_name),"PNG images (*.png)"); dialog.setOption(QFileDialog.Option.DontUseNativeDialog,True); dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave); dialog.setDefaultSuffix("png")
+    return dialog.selectedFiles()[0] if dialog.exec()==QDialog.DialogCode.Accepted and dialog.selectedFiles() else ""
+
+
+class FlowLogsPage(BasePage):
+    COLUMNS=["Origin","Destination","Protocol","Port","Result"]
+    def __init__(self, source):
+        super().__init__(); self.source=source; self.thread=None; self.worker=None; self.flow_logs=[]; self.rows=[]; self.analysis_vpc=""; self.analysis_truncated=False; self.analysis_normalised=False; self.analysis_raw_groups=0
+        root=self.page_header("NETWORK OBSERVABILITY / VPC FLOW LOGS","Flow Logs","Select a VPC interface and group its accepted and rejected CloudWatch Flow Log connections.")
+        panel=QFrame(); panel.setObjectName("operationPanel"); form=QGridLayout(panel); form.setContentsMargins(18,16,18,16); form.setHorizontalSpacing(12)
+        vpc_label=QLabel("VPC"); vpc_label.setObjectName("microLabel"); self.vpc=QComboBox(); self.vpc.setPlaceholderText("Discover VPCs first"); self.vpc.setMinimumHeight(38)
+        eni_label=QLabel("INTERFACE / ASSOCIATED RESOURCE"); eni_label.setObjectName("microLabel"); self.interface=QComboBox(); self.interface.setPlaceholderText("Select a VPC first"); self.interface.setMinimumHeight(38)
+        start_label=QLabel("START UTC"); start_label.setObjectName("microLabel"); self.start=QDateTimeEdit(); self.start.setTimeZone(QTimeZone.utc()); self.start.setCalendarPopup(True); self.start.setDisplayFormat("yyyy-MM-dd HH:mm 'UTC'"); self.start.setDateTime(QDateTime.currentDateTimeUtc().addSecs(-86400)); self.start.setMinimumHeight(38)
+        end_label=QLabel("END UTC"); end_label.setObjectName("microLabel"); self.end=QDateTimeEdit(); self.end.setTimeZone(QTimeZone.utc()); self.end.setCalendarPopup(True); self.end.setDisplayFormat("yyyy-MM-dd HH:mm 'UTC'"); self.end.setDateTime(QDateTime.currentDateTimeUtc()); self.end.setMinimumHeight(38)
+        self.discover=QPushButton("DISCOVER FLOW LOGS"); self.discover.setObjectName("quietButton"); self.discover.setMinimumHeight(38)
+        self.analyse=QPushButton("ANALYSE CONNECTIONS  →"); self.analyse.setObjectName("primaryButton"); self.analyse.setMinimumHeight(38); self.analyse.setEnabled(False)
+        form.addWidget(vpc_label,0,0); form.addWidget(self.vpc,1,0); form.addWidget(eni_label,0,1); form.addWidget(self.interface,1,1); form.addWidget(start_label,0,2); form.addWidget(self.start,1,2); form.addWidget(end_label,0,3); form.addWidget(self.end,1,3); form.addWidget(self.discover,1,4); form.addWidget(self.analyse,1,5); root.addWidget(panel)
+        facets=QHBoxLayout(); facets.setSpacing(8)
+        self.direction_filter=self._facet("DIRECTION", [("ALL", ""), ("INCOMING", "INBOUND"), ("OUTGOING", "OUTBOUND"), ("INTERNAL VPC", "scope:INTERNAL"), ("EXTERNAL", "scope:EXTERNAL")])
+        self.result_filter=self._facet("RESULT", [("ALL", ""), ("ACCEPTED", "ACCEPT"), ("REJECTED", "REJECT")])
+        self.grouping_filter=self._facet("GROUP", [("SERVICE", "service"), ("ENDPOINT", "endpoint")])
+        self.port_mode_filter=self._facet("PORTS", [("NORMALISED", True), ("RAW 5-TUPLE", False)])
+        self.ephemeral_range=QLineEdit("32768-65535"); self.ephemeral_range.setObjectName("columnFilter"); self.ephemeral_range.setPlaceholderText("Ephemeral range"); self.ephemeral_range.setToolTip("Configured client ephemeral-port range, used only by normalised service grouping"); self.ephemeral_range.setMinimumHeight(34); self.ephemeral_range.setFixedWidth(130)
+        self.rank_filter=self._facet("RANK", [("MOST OBSERVED", "observations"), ("MOST BYTES", "bytes"), ("REJECTED FIRST", "rejected")])
+        facets.addWidget(self.direction_filter); facets.addWidget(self.result_filter); facets.addWidget(self.grouping_filter); facets.addWidget(self.port_mode_filter); facets.addWidget(self.ephemeral_range); facets.addWidget(self.rank_filter); facets.addStretch(); root.addLayout(facets)
+        summary=QHBoxLayout(); self.context=QLabel("Discover VPC Flow Logs for the active AWS account."); self.context.setObjectName("inventoryContext"); summary.addWidget(self.context); summary.addStretch(); self.count=QLabel("0 GROUPED PATHS"); self.count.setObjectName("sectionCounter"); summary.addWidget(self.count); root.addLayout(summary)
+        self.tabs=QTabWidget(); self.tabs.setObjectName("inventoryTabs")
+        connections=QWidget(); cl=QVBoxLayout(connections); cl.setContentsMargins(8,12,8,8); header=QHBoxLayout(); title=QLabel("GROUPED CONNECTIONS"); title.setObjectName("sectionTitle"); header.addWidget(title); header.addStretch(); self.export_csv=QPushButton("EXPORT CSV"); self.export_csv.setObjectName("quietButton"); self.export_csv.setEnabled(False); header.addWidget(self.export_csv); cl.addLayout(header)
+        self.table=FilterableTable(self.COLUMNS,"flowLogTable"); self.table.filterChanged.connect(self._table_changed); self.table.table.itemSelectionChanged.connect(self._route_selected); cl.addWidget(self.table,1)
+        self.route_context=QLabel("Select a grouped route to inspect its direction, volume and VPC context."); self.route_context.setObjectName("tunnelInfo"); self.route_context.setWordWrap(True); self.route_context.setMinimumHeight(38); cl.addWidget(self.route_context); self.tabs.addTab(connections,"CONNECTIONS")
+        map_page=QWidget(); ml=QVBoxLayout(map_page); ml.setContentsMargins(0,8,0,0); toolbar=QHBoxLayout(); hint=QLabel("Green = ACCEPT · red = REJECT · only the busiest 60 grouped paths are drawn"); hint.setObjectName("footerText"); toolbar.addWidget(hint); toolbar.addStretch(); self.export_png=QPushButton("EXPORT PNG"); self.export_png.setObjectName("quietButton"); self.export_png.setEnabled(False); toolbar.addWidget(self.export_png); ml.addLayout(toolbar); self.map=FlowLogMap(); ml.addWidget(self.map,1); self.tabs.addTab(map_page,"CONNECTION MAP"); root.addWidget(self.tabs,1)
+        self.detail=QLabel("Discover lists VPCs, interfaces and the CloudWatch Flow Log availability for the active account."); self.detail.setObjectName("footerText"); self.detail.setWordWrap(True); root.addWidget(self.detail)
+        self.discover.clicked.connect(self.load_flow_logs); self.analyse.clicked.connect(self.run_analysis); self.export_csv.clicked.connect(lambda:_export_filtered_table(self,self.table,"Export grouped VPC flows","vpc-flow-connections.csv")); self.export_png.clicked.connect(lambda:self.map.export_png(self)); self.vpc.currentIndexChanged.connect(self._vpc_selected); self.interface.currentIndexChanged.connect(self._flow_selected); self.direction_filter.currentIndexChanged.connect(self._operational_filters_changed); self.result_filter.currentIndexChanged.connect(self._operational_filters_changed); self.grouping_filter.currentIndexChanged.connect(lambda: self.detail.setText("Grouping changed. Run Analyse connections to apply the new CloudWatch aggregation.")); self.port_mode_filter.currentIndexChanged.connect(lambda: self.detail.setText("Port mode changed. Run Analyse connections to apply it.")); self.ephemeral_range.editingFinished.connect(lambda: self.detail.setText("Ephemeral-port range changed. Run Analyse connections to apply it.")); self.rank_filter.currentIndexChanged.connect(self._rank_changed)
+    @staticmethod
+    def _facet(label, values):
+        box=QComboBox(); box.setObjectName("columnFilterCombo"); box.setMinimumHeight(34); box.setMinimumWidth(144); box.setToolTip(label)
+        for text, value in values: box.addItem(f"{label}: {text}", value)
+        return box
+    def _context(self): return self.source.commands.profile.currentText().strip(), self.source.commands.region.currentText().strip() or DEFAULT_REGION
+    def load_flow_logs(self):
+        profile,region=self._context()
+        if not profile: show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","Select an AWS profile in Terminal before discovering Flow Logs."); return
+        self.discover.setEnabled(False); self.status.setText("●  DISCOVERING VPC INVENTORY"); self.thread=QThread(); self.worker=Worker(lambda:_run_with_sso(profile,lambda:discover_vpc_flow_inventory(profile,region))); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self._logs_loaded); self.worker.failed.connect(self._failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self._cleanup); self.thread.start()
+    @Slot(object)
+    def _logs_loaded(self, inventory):
+        self.flow_logs=inventory["flow_logs"]; self.interfaces=inventory["interfaces"]; self.vpc.blockSignals(True); self.vpc.clear()
+        for item in inventory["vpcs"]:
+            vpc_id=item.get("VpcId") or "Unknown VPC"
+            eni_count=sum(1 for eni in self.interfaces if eni.get("VpcId")==item.get("VpcId"))
+            vpc_logs=[log for log in self.flow_logs if log.get("VpcId")==item.get("VpcId")]
+            cloudwatch_count=sum(1 for log in vpc_logs if str(log.get("DestinationType","")).casefold()=="cloud-watch-logs")
+            self.vpc.addItem(f"{vpc_id}  ·  {eni_count} interfaces  ·  {cloudwatch_count} CLOUDWATCH FLOW LOG(S)",item.get("VpcId"))
+        self.vpc.blockSignals(False)
+        if self.vpc.count(): self.vpc.setCurrentIndex(0)
+        self.discover.setEnabled(True); self._vpc_selected(); self.status.setText("●  VPC INVENTORY READY" if inventory["vpcs"] else "◆  NO VPCS"); self.context.setText(f"{len(inventory['vpcs'])} VPC(s) · {len(self.interfaces)} network interfaces discovered")
+    def _vpc_selected(self):
+        vpc_id=self.vpc.currentData(); self.interface.blockSignals(True); self.interface.clear()
+        for item in getattr(self,"interfaces",[]):
+            if item["VpcId"]==vpc_id and self._flow_log_for_interface(vpc_id,item):
+                self.interface.addItem(f"{item['InterfaceId']} · {item['PrivateIp'] or 'no private IP'} · {item['Resource']}",item)
+        if self.interface.count():
+            self.interface.setCurrentIndex(0)
+        self.interface.blockSignals(False); self._flow_selected()
+    def _flow_log_for_interface(self, vpc_id, interface):
+        """Select only a CloudWatch Flow Log that actually covers this ENI.
+
+        A Flow Log can belong directly to an ENI, to the ENI's subnet, or to
+        the VPC.  The latter legitimately covers every ENI in that VPC.
+        """
+        candidates=[item for item in self.flow_logs if item.get("VpcId")==vpc_id and str(item.get("DestinationType","")).casefold()=="cloud-watch-logs"]
+        interface_id=interface.get("InterfaceId",""); subnet_id=interface.get("SubnetId","")
+        return (
+            next((item for item in candidates if item.get("ResourceId")==interface_id),None)
+            or next((item for item in candidates if subnet_id and item.get("ResourceId")==subnet_id),None)
+            or next((item for item in candidates if item.get("ResourceId")==vpc_id),None)
+        )
+    def _flow_selected(self):
+        vpc_id=self.vpc.currentData(); interface=(self.interface.currentData() or {}).get("InterfaceId", "")
+        selected_interface=self.interface.currentData() or {}
+        flow_log=self._flow_log_for_interface(vpc_id,selected_interface) if interface else None
+        self.selected_flow_log=flow_log; self.analyse.setEnabled(bool(self.interface.count()))
+        scope=flow_log.get("Scope", "") if flow_log else ""
+        if flow_log:
+            self.analyse.setToolTip(f"Analyse {scope.lower()} Flow Log {flow_log.get('FlowLogId', '')} with CloudWatch Logs Insights")
+            self.detail.setText(f"{self.interface.count()} ENI(s) covered by a CloudWatch Flow Log · using {scope.lower() or 'CloudWatch'} scope · Log Group: {flow_log.get('LogGroupName') or 'unknown'}.")
+        else:
+            destinations=sorted({str(item.get("DestinationType", "unknown")) for item in self.flow_logs if item.get("VpcId")==vpc_id})
+            self.analyse.setToolTip("Explain why this VPC/interface has no usable CloudWatch Flow Log")
+            self.detail.setText(f"No ENIs covered by a usable CloudWatch Flow Log. AWS destinations found: {', '.join(destinations) or 'none'}.")
+    def _ephemeral_policy(self):
+        text=self.ephemeral_range.text().strip().replace(" ", "")
+        try:
+            start_text,end_text=text.split("-",1); start,end=int(start_text),int(end_text)
+        except (ValueError, AttributeError):
+            start=end=0
+        if not 1 <= start <= end <= 65535:
+            show_dialog(self,QMessageBox.Icon.Warning,"Ephemeral port range","Enter a valid port range, for example 32768-65535.","The range is configurable because operating systems and hardened images can use different ephemeral-port policies.")
+            return None
+        return start,end
+    def run_analysis(self):
+        flow_log=self.selected_flow_log; interface=self.interface.currentData() or {}; profile,region=self._context(); start=self.start.dateTime().toPython().replace(tzinfo=timezone.utc); end=self.end.dateTime().toPython().replace(tzinfo=timezone.utc)
+        if not interface:
+            show_dialog(self,QMessageBox.Icon.Warning,"Flow Log analysis","Select an interface before generating a report.")
+            return
+        if not flow_log:
+            destinations=sorted({str(item.get("DestinationType", "unknown")) for item in self.flow_logs if item.get("VpcId")==self.vpc.currentData()})
+            show_dialog(self,QMessageBox.Icon.Warning,"No usable CloudWatch Flow Log",f"AWS did not return a CloudWatch Flow Log for {self.vpc.currentData()}.",f"Destinations found: {', '.join(destinations) or 'none'}\n\nThis report uses CloudWatch Logs Insights and does not create Athena tables.")
+            return
+        logger.info("Flow Log analysis requested | flow_log=%s vpc=%s interface=%s start=%s end=%s",flow_log.get("FlowLogId",""),flow_log.get("VpcId",""),interface.get("InterfaceId",""),start.isoformat(),end.isoformat())
+        policy=self._ephemeral_policy()
+        if not policy: return
+        aggregation=self.grouping_filter.currentData() or "service"; normalise=bool(self.port_mode_filter.currentData()); ephemeral_start,ephemeral_end=policy; self.analyse.setEnabled(False); self.status.setText("●  ANALYSING FLOW LOGS"); self.detail.setText(f"Querying CloudWatch Logs Insights ({aggregation} grouping): {flow_log.get('LogGroupName') or 'unknown'}…"); self.thread=QThread(); self.worker=Worker(lambda:_run_with_sso(profile,lambda:analyse_flow_log(profile,region,flow_log,start,end,interface.get("InterfaceId", ""),interface.get("PrivateIps") or [interface.get("PrivateIp", "")],aggregation,normalise,ephemeral_start,ephemeral_end))); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self._analysis_ready); self.worker.failed.connect(self._failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self._cleanup); self.thread.start()
+    @Slot(object)
+    def _analysis_ready(self,result):
+        self.rows=result["rows"]; self.analysis_vpc=result["vpc_id"]; self.analysis_raw_groups=result.get("raw_groups",len(self.rows)); self.analysis_normalised=bool(result.get("normalised")); self.analysis_truncated=self.analysis_raw_groups >= 10000; self._rank_changed(); self.export_csv.setEnabled(bool(self.rows)); self.export_png.setEnabled(bool(self.rows)); self.analyse.setEnabled(True); self.status.setText("●  FLOW ANALYSIS READY" if self.rows else "◆  NO FLOWS FOR THIS INTERFACE / RANGE")
+    def _matches_operational_facets(self, row):
+        direction=self.direction_filter.currentData()
+        result=self.result_filter.currentData()
+        if direction.startswith("scope:"):
+            if row.get("Scope") != direction.split(":", 1)[1]: return False
+        elif direction and row.get("Direction") != direction:
+            return False
+        return not result or row.get("Result") == result
+    def _operational_filters_changed(self):
+        self.table.set_row_predicate(self._matches_operational_facets)
+    def _rank_changed(self):
+        ranking=self.rank_filter.currentData()
+        if ranking == "bytes": ordered=sorted(self.rows,key=lambda row: row.get("Bytes",0),reverse=True)
+        elif ranking == "rejected": ordered=sorted(self.rows,key=lambda row: (row.get("Result") == "REJECT",row.get("Observations",0)),reverse=True)
+        else: ordered=sorted(self.rows,key=lambda row: row.get("Observations",0),reverse=True)
+        self.table.set_rows(ordered); self._operational_filters_changed()
+    def _table_changed(self):
+        visible=self.table.filtered_rows(); self.count.setText(self.table.count_text("grouped paths"))
+        selected_interface=self.interface.currentData() or {}
+        self.map.render_rows(self.analysis_vpc or self.vpc.currentData() or "selected VPC",visible,selected_interface)
+        if not self.rows: return
+        inbound=sum(row.get("Observations",0) for row in visible if row.get("Direction")=="INBOUND")
+        outbound=sum(row.get("Observations",0) for row in visible if row.get("Direction")=="OUTBOUND")
+        rejected=sum(row.get("Observations",0) for row in visible if row.get("Result")=="REJECT")
+        suffix=" · TOP 10,000 RAW GROUP LIMIT — narrow the time range or apply a facet" if self.analysis_truncated else ""
+        normalisation=f" · {self.analysis_raw_groups:,} raw groups folded into {len(self.rows):,} conversations" if self.analysis_normalised else " · RAW 5-TUPLE VIEW"
+        self.context.setText(f"{self.analysis_vpc} · {len(visible)} visible paths · IN {inbound:,} · OUT {outbound:,} · REJECT {rejected:,}{normalisation}{suffix}")
+        self.detail.setText(f"CloudWatch Log Group: {getattr(self,'selected_flow_log',{}).get('LogGroupName','unknown')} · {sum(row.get('Observations',0) for row in visible):,} observed records in the active view.")
+    def _route_selected(self):
+        row=self.table.selected_row()
+        if not row: return
+        protocol={"6":"TCP","17":"UDP","1":"ICMP"}.get(str(row.get("Protocol","")),str(row.get("Protocol","")) or "unknown")
+        selected=self.interface.currentData() or {}
+        endpoint=row.get("Origin") if row.get("Direction")=="INBOUND" else row.get("Destination")
+        folded=f" · folded from {row.get('RawGroups',1):,} raw port groups" if self.analysis_normalised else " · raw port tuple"
+        self.route_context.setText(f"{row.get('Direction','TRANSIT')} · {row.get('Scope','EXTERNAL')} · {row.get('Result','')} · remote endpoint {endpoint} · {protocol}/{row.get('Port','')} · {row.get('Observations',0):,} observations · {row.get('Bytes',0):,} bytes{folded} · selected ENI {selected.get('InterfaceId','unknown')} ({selected.get('PrivateIp','no private IP')}).")
+    @Slot(object)
+    def _failed(self,exc):
+        self.discover.setEnabled(True); self._vpc_selected(); self.status.setText("◆  FLOW LOG ERROR"); show_exception(self,"VPC Flow Log analysis failed","discovering or querying VPC Flow Logs",exc if isinstance(exc,Exception) else RuntimeError(str(exc)))
+    def _cleanup(self):
+        if self.thread: self.thread.deleteLater(); self.thread=None
+        self.worker=None
 
 
 class AwsIconProvider(QObject):
@@ -2008,6 +2441,28 @@ class ArchitecturePage(BasePage):
         root.addLayout(summary)
 
         self.inventory = FilterableTable(self.RESOURCE_COLUMNS, filter_options={"Type": [], "Region": [], "Application": []})
+        self.inventory.filterChanged.connect(lambda: self.inventory_count.setText(self.inventory.count_text("resources")))
+
+        resource_page = QWidget()
+        resource_layout = QVBoxLayout(resource_page)
+        resource_layout.setContentsMargins(8, 12, 8, 8)
+        resource_layout.setSpacing(8)
+        resource_toolbar = QHBoxLayout()
+        resource_title = QLabel("RESOURCE INVENTORY")
+        resource_title.setObjectName("sectionTitle")
+        resource_toolbar.addWidget(resource_title)
+        resource_toolbar.addStretch()
+        self.inventory_count = QLabel("0 / 0 resources")
+        self.inventory_count.setObjectName("sectionCounter")
+        resource_toolbar.addWidget(self.inventory_count)
+        self.resource_export = QPushButton("EXPORT CSV")
+        self.resource_export.setObjectName("quietButton")
+        self.resource_export.setMinimumHeight(34)
+        self.resource_export.setEnabled(False)
+        resource_toolbar.addWidget(self.resource_export)
+        resource_layout.addLayout(resource_toolbar)
+        resource_layout.addWidget(self.inventory, 1)
+
         map_page = QWidget(); map_layout = QVBoxLayout(map_page); map_layout.setContentsMargins(0, 0, 0, 0); map_layout.setSpacing(8)
         map_toolbar = QHBoxLayout(); map_toolbar.setSpacing(8)
         map_hint = QLabel("AWS service concept map · layers represent the runtime path · hover a service or path for discovered members and relationships")
@@ -2016,12 +2471,17 @@ class ArchitecturePage(BasePage):
         map_toolbar.addWidget(self.export_png)
         map_layout.addLayout(map_toolbar)
         self.map = ArchitectureMap(); map_layout.addWidget(self.map, 1)
-        root.addWidget(map_page, 1)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("inventoryTabs")
+        self.tabs.addTab(map_page, "ARCHITECTURE MAP")
+        self.tabs.addTab(resource_page, "RESOURCE INVENTORY")
+        root.addWidget(self.tabs, 1)
 
         self.status_detail = QLabel("Discovery has not been run."); self.status_detail.setObjectName("footerText"); self.status_detail.setWordWrap(True); root.addWidget(self.status_detail)
         self.discover.clicked.connect(self.run_discovery)
         self.refresh_view.clicked.connect(self.refresh_view_only)
         self.export_csv.clicked.connect(lambda: _export_filtered_table(self, self.inventory, "Export resource inventory", "resources.csv"))
+        self.resource_export.clicked.connect(lambda: _export_filtered_table(self, self.inventory, "Export resource inventory", "resources.csv"))
         self.export_png.clicked.connect(lambda: self.map.export_png(self))
         self.application.currentIndexChanged.connect(self.apply_scope)
         self.map_detail.currentIndexChanged.connect(self.apply_scope)
@@ -2066,6 +2526,7 @@ class ArchitecturePage(BasePage):
         self.discover.setEnabled(True)
         self.refresh_view.setEnabled(bool(graph.nodes))
         self.export_csv.setEnabled(bool(graph.nodes))
+        self.resource_export.setEnabled(bool(graph.nodes))
         self.export_png.setEnabled(bool(graph.nodes))
         if graph.nodes:
             self.status.setText("●  DISCOVERY COMPLETE")
@@ -2096,6 +2557,9 @@ class ArchitecturePage(BasePage):
 
     def _populate(self, graph):
         tag_key = self.tag_key.currentText().strip() or DEFAULT_TAG_KEY
+        self.refresh_view.setEnabled(bool(graph.nodes))
+        self.export_csv.setEnabled(bool(graph.nodes))
+        self.resource_export.setEnabled(bool(graph.nodes))
         self.export_png.setEnabled(bool(graph.nodes))
         self.application.blockSignals(True); self.application.clear(); self.application.addItem("ALL PRODUCTS")
         for value in graph.applications(tag_key): self.application.addItem(value)
@@ -2131,12 +2595,13 @@ class ArchitecturePage(BasePage):
             details = "; ".join(f"{k}={v}" for k, v in list(node.metadata.items())[:4])
             rows.append({"Type": node.resource_type, "Name": node.name or node.id, "Region": node.region, "Application": node.tags.get(tag_key, "") or "SHARED", "ARN": node.arn or "", "Details": details})
         self.inventory.set_rows(rows)
+        self.inventory_count.setText(self.inventory.count_text("resources"))
         self.count.setText(f"{len(scoped.nodes)} / {len(graph.nodes)} RESOURCES")
         self.context.setText(f"{graph.account_name} · {graph.account_id} · {application} · {len(scoped.edges)} relationships")
         self.map.render_graph(scoped, application, tag_key, detail=self.map_detail.currentText())
 
     def clear_view(self):
-        self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("CONCEPT MAP"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
+        self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.inventory_count.setText("0 / 0 resources"); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("CONCEPT MAP"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.resource_export.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
 
     @staticmethod
     def _demo_graph():
@@ -2207,8 +2672,8 @@ class MainWindow(QMainWindow):
         super().__init__(); logger.info("Application window created | demo=%s", demo); self.setWindowTitle("SSM-SpiceConex · Arrakis Operations"); self.resize(1400,860); self.setMinimumSize(1120,720)
         container=QWidget(); layout=QHBoxLayout(container); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0); self.setCentralWidget(container)
         self.sidebar=Sidebar(); layout.addWidget(self.sidebar); self.stack=QStackedWidget(); layout.addWidget(self.stack,1)
-        self.power=PowerCon(self.sidebar,demo); self.tunnel=Tunneling(self.power); self.command=CommandPage(self.power); self.performance=PerformancePage(self.power); self.connectivity=ConnectivityPage(self.power); self.certificates=CertificatesPage(self.power); self.architecture=ArchitecturePage(self.power,demo)
-        for page in (self.power,self.tunnel,self.command,self.performance,self.connectivity,self.certificates,self.architecture): self.stack.addWidget(page)
+        self.power=PowerCon(self.sidebar,demo); self.tunnel=Tunneling(self.power); self.command=CommandPage(self.power); self.performance=PerformancePage(self.power); self.connectivity=ConnectivityPage(self.power); self.flow_logs=FlowLogsPage(self.power); self.certificates=CertificatesPage(self.power); self.architecture=ArchitecturePage(self.power,demo)
+        for page in (self.power,self.tunnel,self.command,self.performance,self.connectivity,self.flow_logs,self.certificates,self.architecture): self.stack.addWidget(page)
         self.sidebar.pageRequested.connect(self.stack.setCurrentIndex)
         logs_action = QAction(self); logs_action.setShortcut(QKeySequence("Ctrl+L")); logs_action.triggered.connect(lambda: LogViewer(self).exec()); self.addAction(logs_action)
         self.sidebar.update_button.clicked.connect(self.check_updates)

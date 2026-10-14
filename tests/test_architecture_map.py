@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QComboBox
 
-from pyside6_poc.main import ArchitectureMap
+from pyside6_poc.main import ArchitectureMap, ArchitecturePage
 from services.discovery.models import InfrastructureGraph, ResourceEdge, ResourceNode
 
 
@@ -33,3 +34,15 @@ class ArchitectureMapTests(unittest.TestCase):
         self.assertEqual(2, next(edge["count"] for edge in edges if edge["source"] == "service::ALB"))
         view.render_graph(graph)
         self.assertGreater(len(view.scene.items()), 0)
+
+    def test_resource_inventory_tab_remains_available_for_filtered_csv_export(self):
+        profile = QComboBox()
+        region = QComboBox()
+        profile.addItem("engineering")
+        region.addItem("eu-west-1")
+        page = ArchitecturePage(SimpleNamespace(commands=SimpleNamespace(profile=profile, region=region)), demo=True)
+
+        tab_titles = [page.tabs.tabText(index) for index in range(page.tabs.count())]
+        self.assertEqual(["ARCHITECTURE MAP", "RESOURCE INVENTORY"], tab_titles)
+        self.assertGreater(page.inventory.table.rowCount(), 0)
+        self.assertTrue(page.resource_export.isEnabled())

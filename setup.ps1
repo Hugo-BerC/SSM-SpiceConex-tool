@@ -12,12 +12,30 @@ function Write-Step {
 }
 
 function Show-Banner {
+    # Keep the artwork in a literal block: individual quoted strings can be
+    # rendered inconsistently by legacy Windows console hosts when wrapped.
+    $banner = @'
+  _____ _____  ___ ____ _____ ____ ___  _   _  ___  _  _
+ / ___|  ___|/ _ \ / ___| ____/ ___/ _ \| \ | |/ _ \| \| |
+| (__ | |__ | | | | |   |  _|| |  | | | |  \| | | | | .` |
+ \___ \|  _|| |_| | |___| |__| |__| |_| | |\  | |_| | |\  |
+ |___/|_|   \___/ \____|_____|\____\___/|_| \_|\___/|_| \_|
+'@
+    $banner = $banner -split "`r?`n"
+    $requiredWidth = [int](($banner | Measure-Object -Property Length -Maximum).Maximum)
+    $windowWidth = 0
+    try { $windowWidth = $Host.UI.RawUI.WindowSize.Width } catch {}
+
     Write-Host ''
-    Write-Host '  _____ _____  ___ ____ _____ ____ ___  _   _  ___  _  _ ' -ForegroundColor DarkYellow
-    Write-Host ' / ___|  ___|/ _ \ / ___| ____/ ___/ _ \| \ | |/ _ \| \| |' -ForegroundColor DarkYellow
-    Write-Host '| (__ | |__ | | | | |   |  _|| |  | | | |  \| | | | | .` |' -ForegroundColor DarkYellow
-    Write-Host ' \___ \|  _|| |_| | |___| |__| |__| |_| | |\  | |_| | |\  |' -ForegroundColor DarkYellow
-    Write-Host ' |___/|_|   \___/ \____|_____|\____\___/|_| \_|\___/|_| \_|' -ForegroundColor DarkYellow
+    if ($windowWidth -gt 0 -and $windowWidth -lt $requiredWidth) {
+        Write-Host '  [ SPICECONEX ]' -ForegroundColor DarkYellow
+        Write-Host ("  Expand this console to at least {0} columns to display the installation banner." -f $requiredWidth) -ForegroundColor DarkGray
+        Write-Host ''
+        return
+    }
+    foreach ($line in $banner) {
+        Write-Host $line -ForegroundColor DarkYellow
+    }
     Write-Host '                         SPICECONEX' -ForegroundColor Gray
     Write-Host ''
 }
