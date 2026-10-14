@@ -82,17 +82,22 @@ def login_profile(profile: str) -> str | None:
                     if not webbrowser.open(candidate, new=2):
                         logger.warning("Browser handler did not confirm opening the AWS SSO URL")
                     break
-    # Continue draining stdout after opening the browser so the CLI can finish its
-    # polling flow. The first loop breaks only after the full URL is found.
-    if process.stdout:
-        for raw_line in process.stdout:
-            output.append(raw_line.rstrip())
+    # Do not iterate over stdout here: that iteration itself blocks until the
+    # AWS CLI exits, making the wait(timeout=...) below ineffective. communicate
+    # drains the remaining output while enforcing the operator-facing deadline.
     try:
-        return_code = process.wait(timeout=max(AWS_TIMEOUT_SECONDS, 900))
+        remaining_output, _ = process.communicate(timeout=max(AWS_TIMEOUT_SECONDS, 900))
+        output.extend(line for line in remaining_output.splitlines() if line)
+        return_code = process.returncode
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
-        raise RuntimeError("AWS SSO login timed out after 15 minutes. Run 'aws sso login --profile <profile>' manually and retry.")
+        remaining_output, _ = process.communicate()
+        output.extend(line for line in remaining_output.splitlines() if line)
+        raise RuntimeError(
+            "AWS SSO authorization was not completed within 15 minutes. "
+            "Complete the browser authorization opened by SpiceConex, then retry; "
+            "or run 'aws sso login --profile <profile>' manually."
+        )
 
     if return_code != 0:
         details = "\n".join(output[-16:]).strip()
