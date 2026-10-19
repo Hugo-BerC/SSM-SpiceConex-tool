@@ -40,8 +40,9 @@ from services.certificates import (
 )
 from services.discovery.engine import DEFAULT_TAG_KEY, SUPPORTED_TAG_KEYS, discover_infrastructure
 from services.discovery.models import InfrastructureGraph, ResourceNode
-from utils.logging import get_logger, log_path, log_directory
-from app.config import DEFAULT_REGION
+from utils.logging import get_logger, log_path, log_directory, reset_logging_session
+from utils.csv_safety import csv_safe_value
+from app.config import AWS_REGIONS, DEFAULT_REGION
 
 logger = get_logger("ui")
 
@@ -113,6 +114,15 @@ def show_exception(parent, title: str, context: str, exc: Exception,
                    level: QMessageBox.Icon = QMessageBox.Icon.Critical) -> None:
     summary, details = _exception_summary(context, exc)
     show_dialog(parent, level, title, summary, details)
+
+
+def confirm_operation(parent, title: str, summary: str, details: str = "") -> bool:
+    """Require a deliberate operator decision before an AWS write operation."""
+    box = QMessageBox(QMessageBox.Icon.Warning, title, summary, parent=parent)
+    box.setInformativeText(details)
+    box.setStandardButtons(QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes)
+    box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+    return box.exec() == QMessageBox.StandardButton.Yes
 
 
 def shadow(widget, blur=28, y=8, alpha=75):
@@ -225,15 +235,27 @@ class Sidebar(QFrame):
         layout.addSpacing(10)
         profile_label = QLabel("AWS CONTEXT"); profile_label.setObjectName("eyebrow"); layout.addWidget(profile_label)
         self.profile = QLabel("Not connected"); self.profile.setObjectName("sideProfile"); self.profile.setWordWrap(True); layout.addWidget(self.profile)
-        self.status = QLabel("●  SYSTEM READY"); self.status.setObjectName("sideStatus"); layout.addWidget(self.status)
+        self.status = QLabel("●  SYSTEM READY"); self.status.setObjectName("sideStatus"); self.status.setProperty("connectionState", "ready"); layout.addWidget(self.status)
         self.update_button = QPushButton("CHECK FOR UPDATES")
         self.update_button.setObjectName("sidebarUpdateButton")
         self.update_button.setToolTip(f"Current version: {APP_VERSION}")
         layout.addSpacing(8)
+        self.version = QLabel(f"VERSION {APP_VERSION}")
+        self.version.setObjectName("sidebarVersion")
+        self.version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.version.setToolTip("Installed SpiceConex version")
+        layout.addWidget(self.version)
+        layout.addSpacing(5)
         layout.addWidget(self.update_button)
 
     def set_profile(self, profile, region):
         self.profile.setText(f"{profile or 'default'}\n{region}")
+
+    def set_connection_state(self, state: str, text: str):
+        self.status.setText(text)
+        self.status.setProperty("connectionState", state)
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
 
     def set_current_page(self, index):
         if 0 <= index < len(self.buttons):
@@ -258,7 +280,7 @@ class AwsConnectionRail(QFrame):
         completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         left.addWidget(label); left.addWidget(self.profile); layout.addLayout(left)
         region = QVBoxLayout(); region.setSpacing(2); region_label = QLabel("REGION"); region_label.setObjectName("microLabel")
-        self.region = QComboBox(); self.region.setEditable(True); self.region.addItems(["us-east-1", "us-west-2", "eu-west-1", "eu-central-1", "ap-southeast-1"])
+        self.region = QComboBox(); self.region.setEditable(True); self.region.addItems(AWS_REGIONS)
         self.region.setCurrentText(DEFAULT_REGION)
         region.addWidget(region_label); region.addWidget(self.region); layout.addLayout(region)
         self.configure_profiles = QToolButton(); self.configure_profiles.setText("⚙"); self.configure_profiles.setObjectName("quietButton"); self.configure_profiles.setToolTip("Configure or regenerate AWS profiles"); self.configure_profiles.setFixedSize(42,42); layout.addWidget(self.configure_profiles, 0, Qt.AlignmentFlag.AlignBottom)
@@ -273,7 +295,7 @@ class MetricStrip(QFrame):
     def __init__(self):
         super().__init__(); self.setObjectName("metricStrip")
         layout = QHBoxLayout(self); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0); self.values = {}
-        for index, (key, title, value, suffix) in enumerate([("instances", "FLEET", "0", "INSTANCES"), ("running", "HEALTH", "0", "RUNNING"), ("selected", "TARGETS", "0", "SELECTED"), ("region", "SCOPE", DEFAULT_REGION, "REGION")]):
+        for index, (key, title, value, suffix) in enumerate([("instances", "FLEET", "0", "INSTANCES"), ("managed", "SSM READY", "0", "ONLINE"), ("selected", "TARGETS", "0", "SELECTED"), ("region", "SCOPE", DEFAULT_REGION, "REGION")]):
             block = QFrame(); block.setObjectName("metricBlock"); bl = QVBoxLayout(block); bl.setContentsMargins(18, 9, 18, 9); bl.setSpacing(1)
             caption = QLabel(title); caption.setObjectName("metricCaption"); number = QLabel(value); number.setObjectName("metricNumber"); detail = QLabel(suffix); detail.setObjectName("metricDetail")
             bl.addWidget(caption); bl.addWidget(number); bl.addWidget(detail); layout.addWidget(block, 1); self.values[key] = number
@@ -285,12 +307,13 @@ class MetricStrip(QFrame):
 class InstanceRow(QFrame):
     changed = Signal(bool)
     def __init__(self, instance: EC2Instance):
-        super().__init__(); self.instance = instance; self.setObjectName("instanceRow"); self.setProperty("selected", False); self.setMinimumHeight(74)
+        super().__init__(); self.instance = instance; self.setObjectName("instanceRow"); self.setProperty("selected", False); self.setMinimumHeight(82)
         layout = QHBoxLayout(self); layout.setContentsMargins(14, 10, 16, 10); layout.setSpacing(12)
-        self.check = QCheckBox(); self.check.setObjectName("rowCheck"); self.check.setFixedWidth(22); self.check.toggled.connect(self._toggle); layout.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.check = QCheckBox(); self.check.setObjectName("rowCheck"); self.check.setFixedWidth(22); self.check.setEnabled(instance.session_action_eligible); self.check.setToolTip("Ready for AWS Systems Manager session" if instance.session_ready else ("SSM status could not be checked; selection remains available." if instance.ssm_managed is None else "This instance is not currently ready for AWS Systems Manager.")); self.check.toggled.connect(self._toggle); layout.addWidget(self.check, 0, Qt.AlignmentFlag.AlignVCenter)
         identity = QVBoxLayout(); identity.setSpacing(2); name = QLabel(instance.name); name.setObjectName("instanceName"); iid = QLabel(instance.instance_id); iid.setObjectName("instanceId"); identity.addWidget(name); identity.addWidget(iid); layout.addLayout(identity, 2)
         for title, value in [("PRIVATE IP", instance.private_ip or "—"), ("PLATFORM", instance.platform_details or "Unknown")]:
             box = QVBoxLayout(); box.setSpacing(2); a = QLabel(title); a.setObjectName("rowMeta"); b = QLabel(value); b.setObjectName("rowValue"); box.addWidget(a); box.addWidget(b); layout.addLayout(box, 1)
+        ssm = QVBoxLayout(); ssm.setSpacing(2); ssm_title = QLabel("SESSION MANAGER"); ssm_title.setObjectName("rowMeta"); ssm_state = QLabel(instance.ssm_status_label); ssm_state.setObjectName("ssmBadge"); ssm_state.setProperty("ssmState", instance.ssm_status_key); ssm_state.setToolTip(f"Last ping: {instance.ssm_last_ping or 'not reported'}\nAgent: {instance.ssm_agent_version or 'not reported'}"); ssm_state.style().unpolish(ssm_state); ssm_state.style().polish(ssm_state); ssm_ping = QLabel(f"PING {instance.ssm_last_ping_label}"); ssm_ping.setObjectName("rowMeta"); ssm.addWidget(ssm_title); ssm.addWidget(ssm_state); ssm.addWidget(ssm_ping); layout.addLayout(ssm, 1)
         state = QLabel("●  RUNNING" if instance.state.lower() == "running" else "○  STOPPED"); state.setObjectName("stateBadge"); state.setProperty("running", instance.state.lower() == "running"); state.style().unpolish(state); state.style().polish(state); layout.addWidget(state, 0, Qt.AlignmentFlag.AlignVCenter)
     def _toggle(self, checked):
         self.setProperty("selected", checked); self.style().unpolish(self); self.style().polish(self); self.changed.emit(checked)
@@ -310,21 +333,24 @@ class FleetPanel(QFrame):
     def set_instances(self, instances):
         # Rebuild the inventory without retaining visibility state from old widgets.
         selected_ids = {row.instance.instance_id for row in self.rows if row.selected}
-        for row in self.rows:
-            row.setParent(None)
-            row.deleteLater()
         self.rows = []
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
         for instance in instances:
             row = InstanceRow(instance)
             row.changed.connect(self._selection_changed)
-            row.check.setChecked(instance.instance_id in selected_ids)
+            row.check.setChecked(instance.instance_id in selected_ids and row.check.isEnabled())
             self.content_layout.addWidget(row)
             self.rows.append(row)
+        if not instances:
+            empty = QLabel("No EC2 instances are available in this AWS account and region.")
+            empty.setObjectName("fleetEmpty")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.content_layout.addWidget(empty, 1)
         self.content_layout.addStretch()
         self.filter(getattr(self, "_filter_query", ""))
         self._selection_changed()
@@ -344,7 +370,8 @@ class FleetPanel(QFrame):
             matches = not self._filter_query or any(
                 self._filter_query in str(value or "").casefold()
                 for value in (instance.name, instance.instance_id,
-                              instance.private_ip, instance.platform_details)
+                              instance.private_ip, instance.platform_details,
+                              instance.ssm_status_label, instance.ssm_ping_status)
             )
             # setHidden is stable even when the parent scroll area is not yet shown.
             row.setHidden(not matches)
@@ -394,7 +421,7 @@ def _export_filtered_table(parent, table, title: str, default_name: str) -> bool
             writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
             writer.writeheader()
             for row in rows:
-                writer.writerow({header: row.get(table._key(header), "") for header in headers})
+                writer.writerow({header: csv_safe_value(row.get(table._key(header), "")) for header in headers})
         logger.info("CSV export completed | file=%s | rows=%d", path, len(rows))
         show_dialog(parent, QMessageBox.Icon.Information, "CSV export", f"Exported {len(rows)} rows.", f"File: {path}")
         return True
@@ -405,11 +432,11 @@ def _export_filtered_table(parent, table, title: str, default_name: str) -> bool
 
 def demo_instances():
     return [
-        EC2Instance(instance_id="i-0123456789abcde01", name="web-01", private_ip="192.0.2.21", platform_details="Linux/UNIX", state="running"),
-        EC2Instance(instance_id="i-0123456789abcde02", name="web-02", private_ip="192.0.2.22", platform_details="Linux/UNIX", state="running"),
-        EC2Instance(instance_id="i-0123456789abcde03", name="db-01", private_ip="192.0.2.31", platform_details="Linux/UNIX", state="running"),
-        EC2Instance(instance_id="i-0123456789abcde04", name="worker-01", private_ip="192.0.2.41", platform_details="Linux/UNIX", state="stopped"),
-        EC2Instance(instance_id="i-0123456789abcde05", name="gateway-01", private_ip="192.0.2.51", platform_details="Linux/UNIX", state="running"),
+        EC2Instance(instance_id="i-0123456789abcde01", name="web-01", private_ip="192.0.2.21", platform_details="Linux/UNIX", state="running", ssm_managed=True, ssm_ping_status="Online", ssm_last_ping="demo", ssm_agent_version="3.2"),
+        EC2Instance(instance_id="i-0123456789abcde02", name="web-02", private_ip="192.0.2.22", platform_details="Linux/UNIX", state="running", ssm_managed=True, ssm_ping_status="Online", ssm_last_ping="demo", ssm_agent_version="3.2"),
+        EC2Instance(instance_id="i-0123456789abcde03", name="db-01", private_ip="192.0.2.31", platform_details="Linux/UNIX", state="running", ssm_managed=True, ssm_ping_status="ConnectionLost", ssm_last_ping="demo", ssm_agent_version="3.2"),
+        EC2Instance(instance_id="i-0123456789abcde04", name="worker-01", private_ip="192.0.2.41", platform_details="Linux/UNIX", state="stopped", ssm_managed=False),
+        EC2Instance(instance_id="i-0123456789abcde05", name="gateway-01", private_ip="192.0.2.51", platform_details="Linux/UNIX", state="running", ssm_managed=False),
     ]
 
 
@@ -503,7 +530,7 @@ class AWSProfileSetupDialog(QDialog):
         layout.addWidget(title)
         help_text = QLabel(
             "Validate an account with organizations:ListAccounts, then generate one IAM Identity Center profile per AWS account. "
-            "Existing AWS config and credentials files are backed up before they are replaced."
+            "Existing profiles are preserved; only generated SSO profiles are added or refreshed."
         )
         help_text.setObjectName("tunnelInfo")
         help_text.setWordWrap(True)
@@ -521,7 +548,7 @@ class AWSProfileSetupDialog(QDialog):
         self.session_token = self._field(form, 6, "SESSION TOKEN (ASIA KEYS ONLY)", secret=True)
         layout.addLayout(form)
 
-        note = QLabel("Credentials are used only for validation and the Organizations query. They are not written to application logs.")
+        note = QLabel("Credentials are used only in memory for validation and the Organizations query. They are never saved by SpiceConex.")
         note.setObjectName("footerText")
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -596,6 +623,7 @@ class HomePage(DuneBackdrop):
     def _context_changed(self, *_):
         profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip() or DEFAULT_REGION
         self.sidebar.set_profile(profile, region)
+        self.sidebar.set_connection_state("context", "◆  AWS CONTEXT CHANGED")
         self.context.setText("AWS context changed. Connect to AWS when you are ready to load the EC2 fleet.")
         if self.terminal and not self.demo: self.terminal.context_changed()
     def load_profiles(self):
@@ -616,11 +644,11 @@ class HomePage(DuneBackdrop):
         profile=self.commands.profile.currentText().strip()
         if not profile:
             show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","No AWS profile is selected.","Select an AWS profile before continuing."); return
-        self._set_connecting(True); self.context.setText("Connecting to AWS and loading the EC2 fleet…"); self.terminal.load()
+        self._set_connecting(True); self.sidebar.set_connection_state("connecting", "●  CONNECTING TO AWS"); self.context.setText("Connecting to AWS and loading the EC2 fleet…"); self.terminal.load()
     def fleet_loaded(self, count):
-        self._set_connecting(False); self.context.setText(f"AWS connected · {count} EC2 instance(s) loaded in Terminal."); self.connected.emit()
+        self._set_connecting(False); self.sidebar.set_connection_state("connected", "●  AWS CONNECTED"); self.context.setText(f"AWS connected · {count} EC2 instance(s) loaded in Terminal."); self.connected.emit()
     def fleet_failed(self):
-        self._set_connecting(False); self.context.setText("The AWS connection could not load the EC2 fleet. Review the error and retry.")
+        self._set_connecting(False); self.sidebar.set_connection_state("error", "◆  AWS CONNECTION ERROR"); self.context.setText("The AWS connection could not load the EC2 fleet. Review the error and retry.")
     def configure_profiles(self):
         if self.demo:
             show_dialog(self,QMessageBox.Icon.Information,"AWS profile setup","Profile configuration is unavailable in demo mode."); return
@@ -644,13 +672,19 @@ class HomePage(DuneBackdrop):
         if self.demo:
             show_dialog(self,QMessageBox.Icon.Information,"AWS validation","Demo mode is active; no AWS STS request was made."); return
         self._set_connecting(True)
-        try:
-            identity=_run_with_sso(profile,lambda:get_caller_identity(profile,region)); account=identity.get("Account","unknown"); masked=f"••••{account[-4:]}" if account!="unknown" else "unknown"
-            self.context.setText("AWS session is valid. Loading the EC2 fleet…")
-            show_dialog(self,QMessageBox.Icon.Information,"AWS validation succeeded","The selected AWS session is valid. The EC2 fleet will now be loaded.",f"Account: {masked}\nARN: {identity.get('Arn','unknown')}\nRegion: {region}")
+        self.context.setText("Validating the AWS session…")
+        self.thread=QThread(); self.worker=Worker(lambda: _run_with_sso(profile,lambda:get_caller_identity(profile,region))); self.worker.moveToThread(self.thread); worker=self.worker
+        self.thread.started.connect(worker.run); worker.finished.connect(self.validation_succeeded); worker.failed.connect(self.validation_failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+    @Slot(object)
+    def validation_succeeded(self, identity):
+        account=identity.get("Account","unknown"); masked=f"••••{account[-4:]}" if account!="unknown" else "unknown"; region=self.commands.region.currentText().strip() or DEFAULT_REGION
+        self.context.setText("AWS session is valid. Loading the EC2 fleet…")
+        show_dialog(self,QMessageBox.Icon.Information,"AWS validation succeeded","The selected AWS session is valid. The EC2 fleet will now be loaded.",f"Account: {masked}\nARN: {identity.get('Arn','unknown')}\nRegion: {region}")
+        if self.terminal:
             self.terminal.load()
-        except Exception as exc:
-            self._set_connecting(False); self.context.setText("AWS validation failed. Review the error and retry."); show_exception(self,"AWS validation failed","validating the selected AWS session",exc)
+    @Slot(object)
+    def validation_failed(self, exc):
+        self._set_connecting(False); self.context.setText("AWS validation failed. Review the error and retry."); show_exception(self,"AWS validation failed","validating the selected AWS session",exc if isinstance(exc,Exception) else RuntimeError(str(exc)))
     def cleanup(self):
         if self.thread: self.thread.deleteLater(); self.thread=None
         self.worker=None
@@ -664,17 +698,21 @@ class PowerCon(BasePage):
         rail=QFrame(); rail.setObjectName("commandRail"); rail_layout=QHBoxLayout(rail); rail_layout.setContentsMargins(18,12,18,12); rail_layout.setSpacing(16)
         context=QVBoxLayout(); context.setSpacing(2); label=QLabel("ACTIVE AWS CONTEXT"); label.setObjectName("microLabel"); self.active_context=QLabel(); self.active_context.setObjectName("terminalContext"); context.addWidget(label); context.addWidget(self.active_context); rail_layout.addLayout(context)
         rail_layout.addStretch(1); search=QVBoxLayout(); search.setSpacing(2); search_label=QLabel("FLEET SEARCH"); search_label.setObjectName("microLabel"); self.search=QLineEdit(); self.search.setPlaceholderText("Name, instance ID or private IP"); self.search.setClearButtonEnabled(True); self.search.setMinimumWidth(320); search.addWidget(search_label); search.addWidget(self.search); rail_layout.addLayout(search)
-        self.open_sessions=QPushButton("OPEN SSM SESSIONS  →"); self.open_sessions.setObjectName("primaryButton"); self.open_sessions.setMinimumHeight(42); rail_layout.addWidget(self.open_sessions,0,Qt.AlignmentFlag.AlignBottom); root.addWidget(rail)
+        self.open_sessions=QPushButton("OPEN SSM SESSIONS  →"); self.open_sessions.setObjectName("primaryButton"); self.open_sessions.setMinimumHeight(42); self.open_sessions.setEnabled(False); self.open_sessions.setToolTip("Select one or more SSM-ready instances first."); rail_layout.addWidget(self.open_sessions,0,Qt.AlignmentFlag.AlignBottom); root.addWidget(rail)
         self.metrics=MetricStrip(); root.addWidget(self.metrics); self.fleet=FleetPanel(); root.addWidget(self.fleet,1)
         footer=QHBoxLayout(); tip=QLabel("Select instances, then open their SSM sessions. Change AWS context on Home."); tip.setObjectName("footerText"); footer.addWidget(tip); footer.addStretch(); mark=QLabel("ARRAKIS  /  AWS"); mark.setObjectName("footerMark"); footer.addWidget(mark); root.addLayout(footer)
-        self.search.textChanged.connect(self.fleet.filter); self.fleet.selectionChanged.connect(lambda c:self.metrics.set_value("selected",c)); self.open_sessions.clicked.connect(self.connect_target); self.commands.region.currentTextChanged.connect(self._context_label); self.commands.profile.currentTextChanged.connect(self._context_label); self._context_label()
+        self.search.textChanged.connect(self.fleet.filter); self.fleet.selectionChanged.connect(self._selection_changed); self.open_sessions.clicked.connect(self.connect_target); self.commands.region.currentTextChanged.connect(self._context_label); self.commands.profile.currentTextChanged.connect(self._context_label); self._context_label()
         if demo: self.set_instances(demo_instances())
     def _context_label(self, *_):
         profile=self.commands.profile.currentText().strip() or "No profile selected"; region=self.commands.region.currentText().strip() or DEFAULT_REGION; self.active_context.setText(f"{profile}  ·  {region}"); self.metrics.set_value("region",region)
     def context_changed(self):
-        self._context_label(); self.set_instances([]); self.status.setText("◆  CONTEXT CHANGED — CONNECT FROM HOME")
+        self._context_label(); self.set_instances([]); self.open_sessions.setEnabled(False); self.status.setText("◆  CONTEXT CHANGED — CONNECT FROM HOME")
+    def _selection_changed(self, count):
+        self.metrics.set_value("selected", count)
+        self.open_sessions.setEnabled(bool(count))
+        self.open_sessions.setToolTip("Open one terminal per selected instance." if count else "Select one or more SSM-ready instances first.")
     def set_instances(self,instances):
-        logger.info("Updating fleet UI | instances=%d",len(instances)); self.instances=list(instances); self.fleet._filter_query=self.search.text(); self.fleet.set_instances(self.instances); self.instancesChanged.emit(self.instances); self.metrics.set_value("instances",len(self.instances)); self.metrics.set_value("running",sum(i.state.lower()=="running" for i in self.instances))
+        logger.info("Updating fleet UI | instances=%d",len(instances)); self.instances=list(instances); self.fleet._filter_query=self.search.text(); self.fleet.set_instances(self.instances); self.instancesChanged.emit(self.instances); self.metrics.set_value("instances",len(self.instances)); self.metrics.set_value("managed",sum(i.session_ready for i in self.instances))
     def load(self):
         profile=self.commands.profile.currentText().strip()
         if not profile:
@@ -688,13 +726,13 @@ class PowerCon(BasePage):
     @Slot(object)
     def loaded(self, instances):
         logger.info("EC2 fleet loaded into UI | instances=%d", len(instances))
-        self.set_instances(instances); self.open_sessions.setEnabled(True); self.status.setText("●  DEMO MODE" if self.demo else "●  AWS CONNECTED"); self.home.fleet_loaded(len(self.instances))
+        self.set_instances(instances); ready=sum(instance.session_ready for instance in self.instances); self.status.setText("●  DEMO MODE" if self.demo else f"●  AWS CONNECTED · {ready} SSM READY"); self.home.fleet_loaded(len(self.instances))
     @Slot(object)
     def failed(self, exc):
         if not isinstance(exc, Exception):
             exc = RuntimeError(str(exc))
         logger.error("EC2 fleet load failed | %s: %s", type(exc).__name__, exc)
-        self.open_sessions.setEnabled(True); self.status.setText("◆  AWS ERROR"); self.home.fleet_failed()
+        self.open_sessions.setEnabled(False); self.status.setText("◆  AWS ERROR"); self.home.fleet_failed()
         show_exception(self, "AWS error", "loading the EC2 fleet", exc)
     def cleanup(self):
         logger.info("AWS worker thread finished")
@@ -727,10 +765,11 @@ class Tunneling(BasePage):
         source.instancesChanged.connect(self.set_instances); self.target.currentIndexChanged.connect(self._target_changed); self.open_button.clicked.connect(self.open_tunnel); self.set_instances(source.instances)
     def set_instances(self,instances):
         self.target.blockSignals(True); self.target.clear()
-        for i in instances: self.target.addItem(f"{i.name}   ·   {i.instance_id}",i)
+        eligible = [i for i in instances if i.session_action_eligible]
+        for i in eligible: self.target.addItem(f"{i.name}   ·   {i.instance_id}",i)
         self.target.blockSignals(False); self._target_changed()
     def _target_changed(self):
-        i=self.target.currentData(); self.target_info.setText(f"{i.private_ip or 'No private IP'}   ·   {i.platform_details}   ·   {i.state.upper()}" if i else "No target loaded")
+        i=self.target.currentData(); self.open_button.setEnabled(bool(i)); self.open_button.setToolTip("Open an SSM port-forwarding session." if i else "No SSM-ready instance is available in the loaded fleet."); self.target_info.setText(f"{i.private_ip or 'No private IP'}   ·   {i.platform_details}   ·   {i.state.upper()}" if i else "No SSM-ready target loaded. Return to Terminal and refresh the fleet.")
     def open_tunnel(self):
         i=self.target.currentData(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip()
         if not i:
@@ -753,9 +792,13 @@ class CommandPage(BasePage):
         l=QLabel("COMMAND"); l.setObjectName("microLabel"); form.addWidget(l); self.command=QPlainTextEdit(); self.command.setPlaceholderText("uname -a\n# or any command supported by the selected OS"); self.command.setMinimumHeight(150); form.addWidget(self.command)
         footer=QHBoxLayout(); self.output_status=QLabel("READY"); self.output_status.setObjectName("footerText"); footer.addWidget(self.output_status); footer.addStretch(); self.execute=QPushButton("EXECUTE  →"); self.execute.setObjectName("primaryButton"); self.execute.setMinimumHeight(42); footer.addWidget(self.execute); form.addLayout(footer); root.addWidget(panel)
         out_label=QLabel("COMMAND OUTPUT"); out_label.setObjectName("sectionTitle"); root.addWidget(out_label); self.output=QPlainTextEdit(); self.output.setReadOnly(True); self.output.setObjectName("outputBox"); root.addWidget(self.output,1)
-        self.fleet_selection=lambda: self.source.fleet.selected_instances(); source.fleet.selectionChanged.connect(self._selection); self.execute.clicked.connect(self.run_command); self._selection(0)
+        self.fleet_selection=lambda: self.source.fleet.selected_instances(); source.fleet.selectionChanged.connect(self._selection); self.command.textChanged.connect(lambda: self._selection(len(self.fleet_selection()))); self.execute.clicked.connect(self.run_command); self._selection(0)
     def _field(self,title,widget): box=QVBoxLayout(); box.setSpacing(2); l=QLabel(title); l.setObjectName("microLabel"); box.addWidget(l); box.addWidget(widget); w=QWidget(); w.setLayout(box); return w
-    def _selection(self,count): self.target_summary.setText(f"{count} target{'s' if count!=1 else ''} selected")
+    def _selection(self,count):
+        has_command=bool(self.command.toPlainText().strip())
+        self.target_summary.setText(f"{count} target{'s' if count!=1 else ''} selected")
+        self.execute.setEnabled(bool(count) and has_command)
+        self.execute.setToolTip("Confirm and execute the command on the selected SSM targets." if count and has_command else "Select an SSM-ready target and enter a command first.")
     def run_command(self):
         selected=self.fleet_selection(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip(); cmd=self.command.toPlainText().strip(); os_family=self.os_family.currentText()
         if not selected:
@@ -764,8 +807,16 @@ class CommandPage(BasePage):
         if not cmd:
             show_dialog(self, QMessageBox.Icon.Warning, "Empty command", "There is no command to execute.", "Enter a shell command in the command editor before pressing EXECUTE.")
             return
-        self.execute.setEnabled(False); self.output_status.setText("EXECUTING…"); self.output.clear()
         ids=[i.instance_id for i in selected]
+        if not confirm_operation(
+            self,
+            "Confirm Run Command",
+            f"Execute this command on {len(ids)} selected target(s)?",
+            f"AWS profile: {profile}\nRegion: {region}\nOS document: {os_family}\nTargets: {', '.join(ids)}\n\nCommand:\n{cmd}",
+        ):
+            self.output_status.setText("CANCELLED")
+            return
+        self.execute.setEnabled(False); self.output_status.setText("EXECUTING…"); self.output.clear()
         self.thread=QThread(); self.worker=Worker(lambda: _run_with_sso(profile, lambda: send_command(profile,region,ids,cmd,os_family=os_family))); self.worker.moveToThread(self.thread); worker=self.worker
         self.thread.started.connect(worker.run); worker.finished.connect(self.finished); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
     @Slot(object)
@@ -797,16 +848,22 @@ class PerformancePage(BasePage):
         self.ebs_output=QPlainTextEdit(); self.ebs_output.setReadOnly(True); self.ebs_output.setMinimumHeight(180); ef.addWidget(self.ebs_output); grid.addWidget(ebs,0,0)
         csv=QFrame(); csv.setObjectName("operationPanel"); cf=QVBoxLayout(csv); cf.setContentsMargins(20,18,20,18); cf.setSpacing(10); cf.addWidget(self._label("CSV BASELINE ANALYSIS")); self.csv_path=QLineEdit(); self.csv_path.setPlaceholderText("CSV with Timestamp, IOPS and Bytes/s columns"); cf.addWidget(self.csv_path); cr=QHBoxLayout(); self.browse=QPushButton("BROWSE"); self.browse.setObjectName("quietButton"); self.analyze=QPushButton("ANALYZE BASELINE"); self.analyze.setObjectName("primaryButton"); cr.addWidget(self.browse); cr.addWidget(self.analyze); cf.addLayout(cr); self.csv_output=QPlainTextEdit(); self.csv_output.setReadOnly(True); self.csv_output.setMinimumHeight(180); cf.addWidget(self.csv_output); grid.addWidget(csv,0,1)
         root.addLayout(grid); root.addStretch()
-        source.instancesChanged.connect(self.set_instances); self.load_ebs.clicked.connect(self.load_ebs_data); self.dashboard.clicked.connect(self.create_dashboard); self.browse.clicked.connect(self.choose_csv); self.analyze.clicked.connect(self.analyze_csv); self.set_instances(source.instances)
+        source.instancesChanged.connect(self.set_instances); self.load_ebs.clicked.connect(self.load_ebs_data); self.dashboard.clicked.connect(self.create_dashboard); self.browse.clicked.connect(self.choose_csv); self.analyze.clicked.connect(self.analyze_csv); self.ebs_target.currentIndexChanged.connect(self._target_changed); self.set_instances(source.instances)
     def _label(self,t): l=QLabel(t); l.setObjectName("microLabel"); return l
-    def set_instances(self,instances): self.ebs_target.clear(); [self.ebs_target.addItem(f"{i.name} · {i.instance_id}",i) for i in instances]
+    def set_instances(self,instances):
+        self.ebs_target.blockSignals(True); self.ebs_target.clear(); [self.ebs_target.addItem(f"{i.name} · {i.instance_id}",i) for i in instances]; self.ebs_target.blockSignals(False); self._target_changed()
+    def _target_changed(self, *_):
+        self._volumes=[]
+        has_target=bool(self.ebs_target.currentData())
+        self.load_ebs.setEnabled(has_target); self.dashboard.setEnabled(False)
+        self.ebs_output.setPlainText("Select an instance and load its attached EBS volumes." if has_target else "Load the EC2 fleet in Terminal to inspect EBS volumes.")
     def load_ebs_data(self):
         i=self.ebs_target.currentData(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip()
         if not i:
             show_dialog(self, QMessageBox.Icon.Warning, "No target selected", "No EC2 instance is available for EBS analysis.", "Load the EC2 fleet in Terminal and select an instance first.")
             return
         try:
-            volumes=list_instance_volumes(profile,region,i.instance_id); self.ebs_output.setPlainText("\n".join(f"{v['Device']}  {v['VolumeId']}  {v['Type']}  {v['Size']} GiB  IOPS={v['Iops']}  Throughput={v['Throughput']} MB/s" for v in volumes) or "No EBS volumes attached."); self.ebs_target.setProperty("volumes",volumes); self._volumes=volumes
+            volumes=list_instance_volumes(profile,region,i.instance_id); self.ebs_output.setPlainText("\n".join(f"{v['Device']}  {v['VolumeId']}  {v['Type']}  {v['Size']} GiB  IOPS={v['Iops']}  Throughput={v['Throughput']} MB/s" for v in volumes) or "No EBS volumes attached."); self.ebs_target.setProperty("volumes",volumes); self._volumes=volumes; self.dashboard.setEnabled(bool(volumes))
         except Exception as exc: show_exception(self, "EBS error", "loading EBS volume information", exc)
     def create_dashboard(self):
         i=self.ebs_target.currentData(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip(); volumes=getattr(self,"_volumes",[])
@@ -1133,6 +1190,7 @@ class CertificatesPage(BasePage):
         cert_header.addWidget(self.cert_count)
         self.cert_export = QPushButton("EXPORT CSV")
         self.cert_export.setObjectName("quietButton")
+        self.cert_export.setEnabled(False)
         self.cert_export.clicked.connect(lambda: _export_filtered_table(self, self.cert_table, "Export certificate inventory", "certificates.csv"))
         cert_header.addWidget(self.cert_export)
         cert_layout.addLayout(cert_header)
@@ -1155,6 +1213,7 @@ class CertificatesPage(BasePage):
         lb_header.addWidget(self.lb_count)
         self.lb_export = QPushButton("EXPORT CSV")
         self.lb_export.setObjectName("quietButton")
+        self.lb_export.setEnabled(False)
         self.lb_export.clicked.connect(lambda: _export_filtered_table(self, self.lb_table, "Export ALB/NLB correlation", "load-balancers.csv"))
         lb_header.addWidget(self.lb_export)
         lb_layout.addLayout(lb_header)
@@ -1239,6 +1298,8 @@ class CertificatesPage(BasePage):
         balancers = inventory.get("balancers", [])
         self.cert_table.set_rows(certificates)
         self.lb_table.set_rows(balancers)
+        self.cert_export.setEnabled(bool(certificates))
+        self.lb_export.setEnabled(bool(balancers))
         self.cert_count.setText(self.cert_table.count_text("certificates"))
         self.lb_count.setText(self.lb_table.count_text("correlation rows"))
         selected = len(inventory.get("profiles", []))
@@ -1366,7 +1427,7 @@ class ConnectivityPage(BasePage):
         root.addWidget(self.tabs,1)
         self.detail=QPlainTextEdit(); self.detail.setReadOnly(True); self.detail.setMaximumHeight(150); self.detail.setPlaceholderText("Select a validation result for details."); root.addWidget(self.detail)
 
-        source.instancesChanged.connect(self.set_instances); self.browse.clicked.connect(self.choose_csv); self.validate.clicked.connect(self.run); self.results_table.itemSelectionChanged.connect(self.show_detail); self.set_instances(source.instances)
+        source.instancesChanged.connect(self.set_instances); self.target.currentIndexChanged.connect(self._update_validation_action); self.browse.clicked.connect(self.choose_csv); self.validate.clicked.connect(self.run); self.results_table.itemSelectionChanged.connect(self.show_detail); self.set_instances(source.instances)
 
     def _label(self,t): l=QLabel(t); l.setObjectName("microLabel"); return l
     def _field(self,title,widget):
@@ -1376,9 +1437,14 @@ class ConnectivityPage(BasePage):
         table.setMinimumHeight(220); table.verticalHeader().setDefaultSectionSize(30)
     def set_instances(self,instances):
         self.target.blockSignals(True); self.target.clear()
-        for i in instances: self.target.addItem(f"{i.name} · {i.instance_id}",i)
+        for i in (item for item in instances if item.session_action_eligible): self.target.addItem(f"{i.name} · {i.instance_id}",i)
         self.target.blockSignals(False)
         if self.rows: self.connection_map.render_connections(self._source_name(),self.rows)
+        self._update_validation_action()
+    def _update_validation_action(self, *_):
+        ready=bool(self.target.currentData()) and bool(self.rows)
+        self.validate.setEnabled(ready)
+        self.validate.setToolTip("Run the matrix from the selected SSM source instance." if ready else "Select an SSM-ready source instance and attach a connectivity CSV first.")
     def _source_name(self):
         instance=self.target.currentData()
         return f"{instance.name} · {instance.instance_id}" if instance else ""
@@ -1392,6 +1458,7 @@ class ConnectivityPage(BasePage):
                 for c,key in enumerate(("service","destination","port","scope","protocol")): self.input_table.setItem(r,c,QTableWidgetItem(row[key]))
             self.connection_map.render_connections(self._source_name(),rows)
             self.summary.setText(f"Loaded {len(rows)} services from {Path(path).name}")
+            self._update_validation_action()
             logger.info("Connectivity CSV attached | file=%s | services=%d", path, len(rows))
         except Exception as exc:
             logger.exception("Connectivity CSV load failed")
@@ -1426,12 +1493,12 @@ class ConnectivityPage(BasePage):
         ok=sum(1 for r in results if r.get("status","").upper()=="OK"); ko=len(results)-ok
         self.connection_map.render_connections(self._source_name(),self.rows,results)
         self.summary.setText(f"Validated {len(results)} services · OK {ok} · KO {ko} · Source {self.target.currentData().name if self.target.currentData() else ''} · Region {self.source.commands.region.currentText()}")
-        self.validate.setEnabled(True); self.browse.setEnabled(True)
+        self.browse.setEnabled(True); self._update_validation_action()
         logger.info("Connectivity UI updated | results=%d | ok=%d | ko=%d",len(results),ok,ko)
     @Slot(object)
     def failed(self,exc):
         if not isinstance(exc,Exception): exc=RuntimeError(str(exc))
-        self.summary.setText("◆  VALIDATION FAILED"); self.validate.setEnabled(True); self.browse.setEnabled(True); logger.error("Connectivity validation failed | %s: %s", type(exc).__name__, exc)
+        self.summary.setText("◆  VALIDATION FAILED"); self.browse.setEnabled(True); self._update_validation_action(); logger.error("Connectivity validation failed | %s: %s", type(exc).__name__, exc)
         show_exception(self,"Connectivity validation failed","running the CSV connectivity validation",exc)
     def show_detail(self):
         row=self.results_table.currentRow()
@@ -1451,14 +1518,17 @@ QToolTip { background: #151b1c; color: #eee9df; border: 1px solid #3b3930; paddi
 #sidebar { background: #090b0c; border-right: 1px solid #252b2a; }
 #brandLogo { background: transparent; padding: 0; }
 #brandRule { background: rgba(185,104,54,0.48); margin: 0 8px; }
-#sidebarSection { color: #766b59; font-size: 7px; font-weight: 780; letter-spacing: 2.2px; padding-left: 11px; }
-#eyebrow, #microLabel { color: #9a8666; font-size: 8px; font-weight: 760; letter-spacing: 1.9px; }
+#sidebarSection { color: #9a8666; font-size: 9px; font-weight: 780; letter-spacing: 1.7px; padding-left: 11px; }
+#eyebrow, #microLabel { color: #b5a078; font-size: 9px; font-weight: 760; letter-spacing: 1.5px; }
 #navButton { text-align: left; border: 0; border-left: 2px solid transparent; border-radius: 0; padding: 8px 10px; color: #777d79; font-size: 10px; font-weight: 700; background: transparent; }
 #navButton:hover { background: rgba(199,165,106,0.035); color: #d7d0c4; }
 #navButton:checked { background: rgba(185,104,54,0.035); color: #e0c68e; border-left: 2px solid #b96836; padding-left: 10px; }
 #divider { background: #252b2a; }
 #sideProfile { color: #c9c0ae; font-size: 10px; line-height: 1.4; }
 #sideStatus { color: #7ea67a; font-size: 9px; font-weight: 760; letter-spacing: 1.2px; margin-top: 5px; }
+#sideStatus[connectionState="context"], #sideStatus[connectionState="connecting"] { color: #c7a56a; }
+#sideStatus[connectionState="error"] { color: #c56f60; }
+#sidebarVersion { color: #84785f; font-size: 8px; font-weight: 720; letter-spacing: 1.35px; padding: 2px 0; }
 #backdrop { background: #080a0b; }
 #homeContext { color: #c9c0ae; font-size: 11px; background: rgba(8,10,11,0.50); border: 1px solid rgba(199,165,106,0.16); border-radius: 6px; padding: 10px 16px; }
 #terminalContext { color: #d7d0c4; font-size: 11px; font-weight: 650; }
@@ -1469,7 +1539,7 @@ QToolTip { background: #151b1c; color: #eee9df; border: 1px solid #3b3930; paddi
 #commandRail, #operationPanel, #tunnelPanel { background: rgba(17,22,23,0.93); border: 1px solid #29302f; border-top: 2px solid rgba(185,104,54,0.52); border-radius: 11px; }
 QComboBox, QLineEdit, QPlainTextEdit { background: #0e1314; border: 1px solid #28302f; border-radius: 7px; padding: 9px 11px; color: #eee9df; selection-background-color: #3a2d1d; }
 QComboBox:hover, QLineEdit:hover, QPlainTextEdit:hover { border-color: #424946; }
-QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border-color: #b96836; }
+QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 2px solid #d3914d; padding: 8px 10px; }
 QComboBox::drop-down { border: 0; width: 28px; }
 QComboBox::down-arrow { image: none; width: 6px; height: 6px; border-right: 1px solid #c7a56a; border-bottom: 1px solid #c7a56a; margin-right: 10px; }
 QComboBox QAbstractItemView { background: #101516; border: 1px solid #4a3529; selection-background-color: #352217; selection-color: #d47a3f; padding: 6px; outline: 0; }
@@ -1480,6 +1550,7 @@ QComboBox QLineEdit:focus { background: #0e1314; color: #eee9df; border: 0; }
 #quietButton:hover { background: #1d2425; border-color: #4a4c45; }
 #primaryButton { background: #c7a56a; color: #16120d; }
 #primaryButton:hover { background: #dfbd7f; }
+#quietButton:focus, #primaryButton:focus, #navButton:focus, QToolButton:focus { border: 2px solid #d3914d; outline: 0; }
 #metricStrip { background: rgba(13,17,18,0.78); border-top: 1px solid #252c2b; border-bottom: 1px solid #252c2b; }
 #metricBlock { background: transparent; }
 #metricSeparator { background: #252c2b; }
@@ -1496,10 +1567,14 @@ QComboBox QLineEdit:focus { background: #0e1314; color: #eee9df; border: 0; }
 #instanceRow[selected="true"] { background: rgba(185,104,54,0.085); border-color: #7f4b2f; }
 #instanceName { color: #eee9df; font-size: 12px; font-weight: 670; }
 #instanceId { color: #69716c; font-size: 9px; }
-#rowMeta { color: #626a66; font-size: 7px; font-weight: 760; letter-spacing: 1.2px; }
+#fleetEmpty { color: #858a86; font-size: 11px; padding: 42px 18px; }
+#rowMeta { color: #858a86; font-size: 9px; font-weight: 760; letter-spacing: 1px; }
 #rowValue { color: #c9c4b9; font-size: 10px; }
 #stateBadge { color: #777d79; font-size: 9px; font-weight: 760; letter-spacing: .7px; min-width: 92px; }
 #stateBadge[running="true"] { color: #7ea67a; }
+#ssmBadge { font-size: 9px; font-weight: 760; letter-spacing: .6px; color: #c7a56a; }
+#ssmBadge[ssmState="online"] { color: #7ea67a; }
+#ssmBadge[ssmState="connectionlost"], #ssmBadge[ssmState="inactive"], #ssmBadge[ssmState="unmanaged"] { color: #c56f60; }
 QCheckBox::indicator { width: 15px; height: 15px; border-radius: 4px; border: 1px solid #4a504d; background: #0d1213; }
 QCheckBox::indicator:hover { border-color: #9f824f; }
 QCheckBox::indicator:checked { background: #b96836; border-color: #b96836; }
@@ -1968,7 +2043,9 @@ class AwsIconProvider(QObject):
         "EC2": "Compute/EC2.png",
         "Lambda": "Compute/Lambda.png",
         "ECS": "Containers/ElasticContainerService.png",
+        "ECSCluster": "Containers/ElasticContainerService.png",
         "EKS": "Containers/ElasticKubernetesService.png",
+        "EKSNodeGroup": "Containers/ElasticKubernetesService.png",
         "RDS": "Database/RDS.png",
         "ElastiCache": "Database/ElastiCacheElastiCacheforRedis.png",
         "DynamoDB": "Database/DynamoDB.png",
@@ -2038,11 +2115,11 @@ class ArchitectureMap(QGraphicsView):
     """High-level architecture projection of the deterministic infrastructure graph."""
 
     ARCHITECTURE_TYPES = {
-        "VPC", "ALB", "NLB", "Listener", "TargetGroup", "EC2", "AutoScalingGroup", "ECS", "EKS", "Lambda",
+        "VPC", "ALB", "NLB", "Listener", "TargetGroup", "EC2", "AutoScalingGroup", "ECS", "ECSCluster", "EKS", "EKSNodeGroup", "Lambda",
         "RDS", "ElastiCache", "DynamoDB", "EFS", "FSx", "S3", "Route53HostedZone", "CloudFront",
         "GlobalAccelerator", "WAF", "TransitGateway", "VPCPeering", "VPCEndpoint", "InternetGateway", "NATGateway",
     }
-    HIDDEN_ARCH_TYPES = {"NetworkInterface", "SecurityGroup", "RouteTable", "RouteTarget", "Subnet", "EBS", "ACMCertificate"}
+    HIDDEN_ARCH_TYPES = {"NetworkInterface", "SecurityGroup", "RouteTable", "RouteTarget", "Subnet", "EBS", "ACMCertificate", "EFSMountTarget"}
     LANE_ORDER = ("EDGE", "NETWORK", "TRAFFIC", "COMPUTE", "DATA & STORAGE")
 
     def __init__(self, parent=None):
@@ -2130,7 +2207,7 @@ class ArchitectureMap(QGraphicsView):
             return "NETWORK"
         if t in {"alb", "nlb", "listener", "targetgroup"}:
             return "TRAFFIC"
-        if t in {"ec2", "autoscalinggroup", "ecs", "eks", "lambda"}:
+        if t in {"ec2", "autoscalinggroup", "ecs", "ecscluster", "eks", "eksnodegroup", "lambda"}:
             return "COMPUTE"
         return "DATA & STORAGE"
 
@@ -2165,9 +2242,87 @@ class ArchitectureMap(QGraphicsView):
             source = member_to_group.get(edge.source); target = member_to_group.get(edge.target)
             if not source or not target or source == target:
                 continue
-            relation_counts[(source, target)] += 1
-        projected_edges = [{"source": s, "target": t, "count": c} for (s, t), c in relation_counts.items()]
+            relation_counts[(source, target, edge.relation)] += 1
+        projected_edges = [
+            {"source": source, "target": target, "relation": relation, "count": count}
+            for (source, target, relation), count in relation_counts.items()
+        ]
         return groups, projected_edges
+
+    @staticmethod
+    def _node_vpc(graph: InfrastructureGraph, node: ResourceNode) -> str:
+        """Resolve VPC placement from explicit AWS metadata or placement edges.
+
+        Data-flow edges (for example, EC2 -> S3) must never turn a regional or
+        global service into a member of the EC2 VPC.  Only an AWS placement
+        relationship is allowed as a fallback when the collector had no VpcId.
+        """
+        if node.resource_type == "VPC":
+            return node.id
+        vpc_id = node.metadata.get("VpcId") or node.metadata.get("VPCId")
+        if vpc_id:
+            return str(vpc_id)
+        subnet_id = node.metadata.get("SubnetId")
+        subnet = graph.nodes.get(str(subnet_id)) if subnet_id else None
+        if subnet and subnet.metadata.get("VpcId"):
+            return str(subnet.metadata["VpcId"])
+        for edge in graph.edges:
+            if edge.relation not in {"contains", "attached_to", "associated_with", "is_contained_in", "is_attached_to", "is_associated_with"}:
+                continue
+            related = edge.target if edge.source == node.id else edge.source if edge.target == node.id else ""
+            related_node = graph.nodes.get(related)
+            if related_node and related_node.resource_type == "VPC":
+                return related_node.id
+            if related_node and (related_node.metadata.get("VpcId") or related_node.metadata.get("VPCId")):
+                return str(related_node.metadata.get("VpcId") or related_node.metadata.get("VPCId"))
+            if related_node and related_node.resource_type == "Subnet" and related_node.metadata.get("VpcId"):
+                return str(related_node.metadata["VpcId"])
+        return ""
+
+    def _build_architecture_projection(self, graph: InfrastructureGraph, tag_key: str):
+        """Project service concepts per actual region/VPC, never by name heuristics."""
+        groups = {}
+        member_to_group = {}
+        for node in graph.nodes.values():
+            if node.resource_type == "VPC" or node.resource_type in self.HIDDEN_ARCH_TYPES:
+                continue
+            vpc_id = self._node_vpc(graph, node)
+            placement = vpc_id or "REGIONAL / GLOBAL"
+            gid = f"architecture::{node.region}::{placement}::{node.resource_type}"
+            group = groups.setdefault(gid, {
+                "id": gid, "resource_type": node.resource_type, "name": node.resource_type,
+                "region": node.region, "vpc": vpc_id, "members": [],
+                "tag": self._tag_value(node, tag_key), "azs": set(), "subnets": set(),
+            })
+            group["members"].append(node)
+            if node.metadata.get("AvailabilityZone"):
+                group["azs"].add(node.metadata["AvailabilityZone"])
+            if node.metadata.get("SubnetId"):
+                group["subnets"].add(str(node.metadata["SubnetId"]))
+            # Managed services can expose placement through a child resource,
+            # such as an EFS mount target. Use only an observed one-hop edge.
+            for edge in graph.edges:
+                related_id = edge.target if edge.source == node.id else edge.source if edge.target == node.id else ""
+                related = graph.nodes.get(related_id)
+                if not related:
+                    continue
+                if related.metadata.get("AvailabilityZone"):
+                    group["azs"].add(related.metadata["AvailabilityZone"])
+                if related.resource_type == "Subnet":
+                    group["subnets"].add(related.id)
+                elif related.metadata.get("SubnetId"):
+                    group["subnets"].add(str(related.metadata["SubnetId"]))
+            member_to_group[node.id] = gid
+
+        relation_counts = defaultdict(int)
+        for edge in graph.edges:
+            source, target = member_to_group.get(edge.source), member_to_group.get(edge.target)
+            if source and target and source != target:
+                relation_counts[(source, target, edge.relation)] += 1
+        return groups, [
+            {"source": source, "target": target, "relation": relation, "count": count}
+            for (source, target, relation), count in relation_counts.items()
+        ]
 
     @staticmethod
     def _group_title(group):
@@ -2176,7 +2331,12 @@ class ArchitectureMap(QGraphicsView):
     @staticmethod
     def _group_subtitle(group):
         regions = sorted({m.region for m in group["members"] if m.region})
-        return f"{len(group['members'])} resource{'s' if len(group['members']) != 1 else ''} · {', '.join(regions) or 'global'}"
+        placement = ", ".join(regions) or "global"
+        azs = sorted(group.get("azs", set()))
+        if azs:
+            visible_azs = ", ".join(azs[:2])
+            placement += f" · {visible_azs}{' +' + str(len(azs) - 2) if len(azs) > 2 else ''}"
+        return f"{len(group['members'])} resource{'s' if len(group['members']) != 1 else ''} · {placement}"
 
     def render_graph(self, graph: InfrastructureGraph, application: str | None = None,
                      tag_key: str = DEFAULT_TAG_KEY, detail: str = "ARCHITECTURE"):
@@ -2190,8 +2350,11 @@ class ArchitectureMap(QGraphicsView):
             visible_ids = {n.id for n in nodes}
             self._render_full(graph, nodes, [e for e in graph.edges if e.source in visible_ids and e.target in visible_ids], tag_key, application)
             return
-        groups, projected_edges = self._build_projection(graph, tag_key)
-        self._render_architecture(graph, groups, projected_edges, tag_key, application)
+        if detail.upper().startswith("CONCEPT"):
+            groups, projected_edges = self._build_projection(graph, tag_key)
+            self._render_conceptual(graph, groups, projected_edges, tag_key)
+            return
+        self._render_deployment_architecture(graph, tag_key, application)
 
     def _add_icon(self, resource_type, x, y, size=52):
         path = self.icons.path(resource_type)
@@ -2270,8 +2433,6 @@ class ArchitectureMap(QGraphicsView):
 
     def _render_architecture(self, graph, groups, projected_edges, tag_key, application):
         """Region/VPC topology, with AZ-aware compute grouping and direct API edges."""
-        self._render_conceptual(graph, groups, projected_edges, tag_key)
-        return
         from collections import Counter
         from math import ceil
 
@@ -2280,6 +2441,8 @@ class ArchitectureMap(QGraphicsView):
             members = group["members"]
             regions = {n.region or "global" for n in members}
             region = next(iter(regions)) if len(regions) == 1 else "MULTI-REGION"
+            if group.get("vpc"):
+                return region, group["vpc"]
             vpcs = set()
             for n in members:
                 md = n.metadata
@@ -2319,7 +2482,10 @@ class ArchitectureMap(QGraphicsView):
                         y = start_y + 64 + row * (node_h + row_gap)
                         positions[group["id"]] = (x, y)
                 box_height = 88 + max_rows * (node_h + row_gap)
-                boxes.append(("vpc", 36, start_y, region_width, box_height, vpc))
+                vpc_node = graph.nodes.get(vpc)
+                vpc_name = (vpc_node.name or vpc) if vpc_node else vpc
+                label = f"{vpc}  /  {vpc_name}" if vpc_name != vpc else vpc
+                boxes.append(("vpc", 36, start_y, region_width, box_height, label))
                 cursor_y += box_height + 26
             boxes.append(("region", 12, region_y, region_width + 48, cursor_y - region_y - 8, region))
             cursor_y += 34
@@ -2374,6 +2540,356 @@ class ArchitectureMap(QGraphicsView):
         legend.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
         legend.setPos(18, 10)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-30, -30, 40, 40))
+        self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
+    @staticmethod
+    def _node_subnet(graph: InfrastructureGraph, node: ResourceNode) -> str:
+        """Resolve a concrete subnet without guessing from application traffic.
+
+        A service can be in a VPC but span several subnets/AZs (ALB, RDS,
+        target groups, EFS).  It belongs in a subnet cell only when the AWS
+        discovery response provides one explicit subnet, or when it has exactly
+        one explicit subnet attachment.  Multiple attachments mean multi-AZ or
+        multi-subnet placement and therefore stay in the VPC shared area.
+        """
+        if node.resource_type == "Subnet":
+            return node.id
+        subnet_id = node.metadata.get("SubnetId") or node.metadata.get("subnet_id")
+        if subnet_id:
+            return str(subnet_id)
+        subnet_ids = node.metadata.get("SubnetIds") or node.metadata.get("subnet_ids")
+        if isinstance(subnet_ids, (list, tuple, set)) and len(subnet_ids) == 1:
+            return str(next(iter(subnet_ids)))
+        attached_subnets = set()
+        for edge in graph.edges:
+            if edge.relation not in {"attached_to", "is_attached_to"}:
+                continue
+            related_id = edge.target if edge.source == node.id else edge.source if edge.target == node.id else ""
+            related = graph.nodes.get(related_id)
+            if not related:
+                continue
+            if related.resource_type == "Subnet":
+                attached_subnets.add(related.id)
+            elif related.resource_type == "NetworkInterface" and related.metadata.get("SubnetId"):
+                attached_subnets.add(str(related.metadata["SubnetId"]))
+        if len(attached_subnets) == 1:
+            return next(iter(attached_subnets))
+        return ""
+
+    @staticmethod
+    def _architecture_items(nodes: list[ResourceNode], limit: int = 6) -> list[list[ResourceNode]]:
+        """Keep deployment maps usable without hiding the composition of a cell."""
+        by_type = defaultdict(list)
+        for node in nodes:
+            by_type[node.resource_type].append(node)
+        result = []
+        for resource_type in sorted(by_type):
+            members = sorted(by_type[resource_type], key=lambda node: (node.name or node.id).casefold())
+            result.extend([members] if len(members) > limit else [[member] for member in members])
+        return result
+
+    @staticmethod
+    def _attached_interfaces(graph: InfrastructureGraph, resource_ids: set[str]) -> dict[str, list[ResourceNode]]:
+        """Return only ENIs with one explicit, visible resource attachment.
+
+        Network interfaces are implementation detail, not peer architecture
+        components.  Rendering orphan ENIs produces visual noise, while placing
+        a confirmed ENI inside its parent resource preserves the AWS attachment
+        model without inventing ownership from an address or description.
+        """
+        attached = defaultdict(list)
+        attachment_relations = {"attached_to", "is_attached_to"}
+        for interface in graph.nodes.values():
+            if interface.resource_type != "NetworkInterface":
+                continue
+            targets = set()
+            for edge in graph.edges:
+                if edge.relation not in attachment_relations:
+                    continue
+                if edge.source == interface.id and edge.target in resource_ids:
+                    targets.add(edge.target)
+                elif edge.target == interface.id and edge.source in resource_ids:
+                    targets.add(edge.source)
+            declared_target = str(interface.metadata.get("AttachmentInstanceId", ""))
+            if declared_target in resource_ids:
+                targets.add(declared_target)
+            if len(targets) == 1:
+                attached[next(iter(targets))].append(interface)
+        return {
+            resource_id: sorted(interfaces, key=lambda item: (item.name or item.id).casefold())
+            for resource_id, interfaces in attached.items()
+        }
+
+    def _deployment_card(self, members, x, y, w, h, tag_key, attached_interfaces=None):
+        """Draw either a concrete AWS resource or a bounded homogeneous stack."""
+        primary = members[0]
+        attached_interfaces = attached_interfaces or {}
+        interfaces = [
+            interface for member in members
+            for interface in attached_interfaces.get(member.id, [])
+        ]
+        tagged = any(node.tags.get(tag_key, "").strip() for node in members)
+        lane = self._lane(primary.resource_type)
+        accent = QColor(211, 145, 77, 240) if lane in {"EDGE", "TRAFFIC"} else QColor(107, 152, 133, 225)
+        if lane == "COMPUTE":
+            accent = QColor(105, 125, 201, 225)
+        if lane == "DATA & STORAGE":
+            accent = QColor(117, 170, 92, 225)
+        card = QGraphicsRectItem(x, y, w, h)
+        card.setBrush(QColor(22, 27, 28, 250))
+        card.setPen(QPen(accent if tagged else QColor(80, 94, 92, 220), 1.4))
+        tooltip = []
+        for node in members[:25]:
+            tooltip.append(self._tooltip(node))
+        if len(members) > 25:
+            tooltip.append(f"... +{len(members) - 25} more resources")
+        if interfaces:
+            tooltip.append("Attached network interface(s):")
+            for interface in interfaces[:25]:
+                private_ip = interface.metadata.get("PrivateIp", "")
+                tooltip.append(f"- {interface.id}{' / ' + str(private_ip) if private_ip else ''}")
+            if len(interfaces) > 25:
+                tooltip.append(f"... +{len(interfaces) - 25} more network interfaces")
+        card.setToolTip("\n\n".join(tooltip))
+        card.setZValue(3)
+        self.scene.addItem(card)
+
+        icon = self._add_icon(primary.resource_type, x + 10, y + 22, 38)
+        if icon:
+            icon.setZValue(5)
+        tx = x + 58
+        type_text = self.scene.addText(primary.resource_type.upper()[:30])
+        type_text.setDefaultTextColor(accent)
+        type_text.setFont(QFont("Segoe UI", 6, QFont.Weight.Bold))
+        type_text.setPos(tx, y + 8)
+        type_text.setZValue(5)
+        if len(members) == 1:
+            title_value = primary.name or primary.id
+            detail = primary.metadata.get("State") or primary.metadata.get("Engine") or primary.metadata.get("InstanceType") or primary.id
+        else:
+            title_value = f"{len(members)} discovered resources"
+            detail = "Stacked in this network cell"
+        title = self.scene.addText(str(title_value)[:27])
+        title.setDefaultTextColor(QColor(TEXT))
+        title.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        title.setPos(tx, y + 25)
+        title.setZValue(5)
+        footer = self.scene.addText(str(detail)[:31])
+        footer.setDefaultTextColor(QColor(MUTED))
+        footer.setFont(QFont("Segoe UI", 6))
+        footer.setPos(tx, y + 47)
+        footer.setZValue(5)
+        if interfaces:
+            interface_box = QGraphicsRectItem(tx, y + 61, w - (tx - x) - 8, 16)
+            interface_box.setBrush(QColor(27, 41, 40, 245))
+            interface_box.setPen(QPen(QColor(82, 133, 122, 220), 0.8))
+            interface_box.setZValue(4)
+            if len(interfaces) == 1:
+                interface = interfaces[0]
+                private_ip = str(interface.metadata.get("PrivateIp", ""))
+                interface_text = f"ENI {interface.id[:16]}{' / ' + private_ip if private_ip else ''}"
+            else:
+                interface_text = f"{len(interfaces)} ATTACHED NETWORK INTERFACES"
+            interface_label = self.scene.addText(interface_text[:31])
+            interface_label.setDefaultTextColor(QColor(129, 190, 162))
+            interface_label.setFont(QFont("Segoe UI", 5, QFont.Weight.DemiBold))
+            interface_label.setPos(tx + 5, y + 64)
+            interface_label.setZValue(5)
+
+    def _render_deployment_architecture(self, graph, tag_key, application):
+        """Draw a deployment topology: region -> VPC -> AZ -> subnet -> resource.
+
+        This deliberately differs from the concept map.  A resource is placed
+        in a network cell only when AWS returned a VPC/subnet relationship;
+        regional and global resources stay outside all VPC boundaries.
+        """
+        from math import ceil
+
+        structural_types = set(self.HIDDEN_ARCH_TYPES) | {"VPC"}
+        visible = [node for node in graph.nodes.values() if node.resource_type not in structural_types]
+        vpcs_by_region = defaultdict(set)
+        cells = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        regional = defaultdict(list)
+
+        for node in graph.nodes.values():
+            if node.resource_type == "VPC":
+                vpcs_by_region[node.region or "global"].add(node.id)
+        for node in visible:
+            region = node.region or "global"
+            vpc_id = self._node_vpc(graph, node)
+            if vpc_id:
+                vpcs_by_region[region].add(vpc_id)
+                cells[region][vpc_id][self._node_subnet(graph, node)].append(node)
+            else:
+                regional[region].append(node)
+
+        node_w, node_h, gap = 194, 84, 12
+        positions = {}
+        boundaries = []
+        cards = []
+        attached_interfaces = self._attached_interfaces(graph, {node.id for node in visible})
+
+        def place_items(items, x, y, columns=1):
+            grouped_items = self._architecture_items(items)
+            for index, members in enumerate(grouped_items):
+                col, row = index % columns, index // columns
+                px, py = x + col * (node_w + gap), y + row * (node_h + gap)
+                cards.append((members, px, py, node_w, node_h))
+                for member in members:
+                    positions[member.id] = (px, py, node_w, node_h)
+            return ceil(len(grouped_items) / columns) if grouped_items else 0
+
+        cursor_y = 78
+        rendered_regions = sorted(set(vpcs_by_region) | set(regional), key=lambda value: (value == "global", value))
+        for region in rendered_regions:
+            region_start = cursor_y
+            region_label = "GLOBAL AWS SERVICES" if region == "global" else f"AWS REGION / {region}"
+            content_y = region_start + 48
+            region_content_width = 340
+
+            outside = regional.get(region, [])
+            if outside:
+                outside_items = self._architecture_items(outside)
+                outside_columns = min(4, max(1, len(outside_items)))
+                outside_width = max(280, 30 + outside_columns * (node_w + gap))
+                outside_rows = place_items(outside, 52, content_y + 42, columns=outside_columns)
+                outside_height = 52 + max(1, outside_rows) * (node_h + gap) + 16
+                scope_title = "GLOBAL SERVICES" if region == "global" else "REGIONAL SERVICES / OUTSIDE VPC"
+                boundaries.append(("regional", 36, content_y, outside_width, outside_height, scope_title))
+                region_content_width = max(region_content_width, outside_width + 36)
+                content_y += outside_height + 18
+
+            for vpc_id in sorted(vpcs_by_region.get(region, set())):
+                vpc_node = graph.nodes.get(vpc_id)
+                vpc_name = (vpc_node.name or vpc_id) if vpc_node else vpc_id
+                cidr = vpc_node.metadata.get("CidrBlock", "") if vpc_node else ""
+                subnet_cells = cells[region][vpc_id]
+                known_subnets = [
+                    node for node in graph.nodes.values()
+                    if node.resource_type == "Subnet" and str(node.metadata.get("VpcId", "")) == vpc_id and node.region == region
+                ]
+                for subnet in known_subnets:
+                    subnet_cells.setdefault(subnet.id, [])
+                shared = list(subnet_cells.pop("", []))
+                by_az = defaultdict(list)
+                for subnet_id, resources in subnet_cells.items():
+                    subnet = graph.nodes.get(subnet_id)
+                    az = (subnet.metadata.get("AvailabilityZone") if subnet else "") or "AZ NOT REPORTED"
+                    by_az[az].append((subnet_id, subnet, resources))
+
+                # Width is content-driven.  The previous fixed 980px region
+                # made small, single-AZ VPCs look like an empty canvas rather
+                # than a deployment boundary.
+                az_count = max(1, len(by_az))
+                shared_items = self._architecture_items(shared)
+                shared_columns = min(3, max(1, len(shared_items)))
+                az_required_width = 16 + az_count * 244
+                shared_required_width = 30 + shared_columns * (node_w + gap)
+                vpc_width = max(280, az_required_width, shared_required_width)
+                shared_rows = place_items(shared, 54, content_y + 64, shared_columns) if shared else 0
+                shared_height = 0 if not shared else 42 + shared_rows * (node_h + gap) + 12
+                az_top = content_y + 48 + shared_height
+                az_heights = {}
+                for az, subnet_entries in by_az.items():
+                    height = 44
+                    for _subnet_id, _subnet, resources in subnet_entries:
+                        resource_rows = max(1, len(self._architecture_items(resources)))
+                        height += 42 + resource_rows * (node_h + gap) + 12
+                    az_heights[az] = height
+                az_height = max(az_heights.values(), default=80)
+                vpc_height = 58 + shared_height + az_height + 22
+                boundaries.append(("vpc", 36, content_y, vpc_width, vpc_height, f"VPC / {vpc_name} / {vpc_id}{' / ' + cidr if cidr else ''}"))
+
+                if shared:
+                    boundaries.append(("shared", 48, content_y + 38, vpc_width - 24, shared_height, "SHARED OR MULTI-AZ SERVICES"))
+                for az_index, az in enumerate(sorted(by_az)):
+                    az_x = 52 + az_index * 244
+                    boundaries.append(("az", az_x, az_top, 228, az_height, f"AVAILABILITY ZONE / {az}"))
+                    subnet_y = az_top + 32
+                    for subnet_id, subnet, resources in sorted(by_az[az], key=lambda item: item[0]):
+                        subnet_name = (subnet.name or subnet_id) if subnet else subnet_id
+                        item_rows = max(1, ceil(len(self._architecture_items(resources)) / 1))
+                        subnet_height = 30 + item_rows * (node_h + gap) + 10
+                        boundaries.append(("subnet", az_x + 9, subnet_y, 210, subnet_height, f"SUBNET / {subnet_name}"))
+                        place_items(resources, az_x + 17, subnet_y + 25)
+                        subnet_y += subnet_height + 10
+                region_content_width = max(region_content_width, vpc_width + 36)
+                content_y += vpc_height + 22
+
+            region_height = max(110, content_y - region_start + 10)
+            boundaries.append(("region", 18, region_start, region_content_width, region_height, region_label))
+            cursor_y = region_start + region_height + 30
+
+        # Draw boundaries from outside to inside before edges and cards.
+        styles = {
+            "region": (QColor(18, 24, 25, 120), QColor(197, 140, 77, 185), -30, 10),
+            "vpc": (QColor(25, 31, 31, 135), QColor(207, 154, 87, 185), -25, 8),
+            "shared": (QColor(21, 28, 29, 135), QColor(89, 112, 107, 160), -20, 7),
+            "az": (QColor(30, 35, 35, 115), QColor(83, 113, 117, 170), -15, 7),
+            "subnet": (QColor(17, 23, 24, 165), QColor(72, 86, 86, 175), -10, 6),
+            "regional": (QColor(25, 29, 29, 130), QColor(130, 118, 86, 175), -20, 8),
+        }
+        for kind, x, y, width, height, title in boundaries:
+            fill, pen_color, z, font_size = styles[kind]
+            box = self.scene.addRect(x, y, width, height)
+            box.setBrush(fill)
+            box.setPen(QPen(pen_color, 1.4 if kind in {"region", "vpc"} else 1.0))
+            box.setZValue(z)
+            label = self.scene.addText(title)
+            label.setDefaultTextColor(QColor(SPICE if kind in {"region", "vpc"} else SAND))
+            label.setFont(QFont("Segoe UI", font_size, QFont.Weight.Bold))
+            label.setPos(x + 11, y + 8)
+            label.setZValue(z + 1)
+
+        structural_relations = {"contains", "attached_to", "associated_with", "is_contained_in", "is_attached_to", "is_associated_with"}
+        meaningful = []
+        for edge in graph.edges:
+            if edge.source not in positions or edge.target not in positions:
+                continue
+            source_type = graph.nodes[edge.source].resource_type
+            target_type = graph.nodes[edge.target].resource_type
+            if edge.relation in structural_relations:
+                # Listener and managed-service containment are useful runtime
+                # paths; VPC/subnet containment is already represented by boxes.
+                if not (edge.relation == "contains" and source_type in {"ALB", "NLB", "ECSCluster", "EKS"} and target_type in {"Listener", "ECS", "EKSNodeGroup"}):
+                    continue
+            meaningful.append(edge)
+        bundles = defaultdict(list)
+        for edge in meaningful:
+            source, target = positions[edge.source], positions[edge.target]
+            key = tuple(sorted((edge.source, edge.target)))
+            bundles[key].append(edge)
+        for edges in bundles.values():
+            edge = edges[0]
+            x1, y1, w1, h1 = positions[edge.source]
+            x2, y2, w2, h2 = positions[edge.target]
+            sx, sy = x1 + w1 / 2, y1 + h1 / 2
+            tx, ty = x2 + w2 / 2, y2 + h2 / 2
+            bend = (sx + tx) / 2
+            path = QPainterPath(QPointF(sx, sy))
+            path.cubicTo(bend, sy, bend, ty, tx, ty)
+            line = QGraphicsPathItem(path)
+            line.setPen(QPen(QColor(206, 165, 93, 190), min(3.0, 1.2 + len(edges) * 0.25)))
+            line.setZValue(1)
+            relations = ", ".join(sorted({item.relation for item in edges}))
+            line.setToolTip(f"Observed runtime relationship(s): {relations}\nLinks consolidated: {len(edges)}")
+            self.scene.addItem(line)
+
+        for members, x, y, width, height in cards:
+            self._deployment_card(members, x, y, width, height, tag_key, attached_interfaces)
+
+        topology_nodes = len(visible)
+        vpc_count = sum(len(vpcs) for vpcs in vpcs_by_region.values())
+        attached_interface_count = sum(len(interfaces) for interfaces in attached_interfaces.values())
+        legend = self.scene.addText(
+            f"DEPLOYMENT TOPOLOGY | {len(rendered_regions)} REGION SCOPE(S) | "
+            f"{vpc_count} VPC(S) | {topology_nodes} VISIBLE RESOURCES | {attached_interface_count} ATTACHED ENI(S)"
+        )
+        legend.setToolTip("Nested boundaries represent AWS containment. Lines show observed runtime relationships.")
+        legend.setDefaultTextColor(QColor(SAND))
+        legend.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        legend.setPos(20, 18)
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-30, -28, 40, 35))
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def _render_full(self, graph, nodes, edges, tag_key, application):
@@ -2436,7 +2952,7 @@ class ArchitecturePage(BasePage):
         app_label = QLabel("APPLICATION / COMPONENT"); app_label.setObjectName("microLabel")
         self.application = QComboBox(); self.application.setEditable(False); self.application.addItem("ALL PRODUCTS"); self.application.setMinimumHeight(38)
         detail_label = QLabel("MAP DETAIL"); detail_label.setObjectName("microLabel")
-        self.map_detail = QComboBox(); self.map_detail.addItems(["CONCEPT MAP"]); self.map_detail.setMinimumHeight(38)
+        self.map_detail = QComboBox(); self.map_detail.addItems(["ARCHITECTURE MAP", "CONCEPT MAP", "FULL RESOURCE GRAPH"]); self.map_detail.setMinimumHeight(38)
         self.discover = QPushButton("DISCOVER INFRASTRUCTURE  →"); self.discover.setObjectName("primaryButton"); self.discover.setMinimumHeight(38)
         self.refresh_view = QPushButton("REFRESH VIEW  ↻"); self.refresh_view.setObjectName("quietButton"); self.refresh_view.setMinimumHeight(38); self.refresh_view.setEnabled(False)
         self.export_csv = QPushButton("EXPORT CSV"); self.export_csv.setObjectName("quietButton"); self.export_csv.setMinimumHeight(38); self.export_csv.setEnabled(False)
@@ -2480,7 +2996,7 @@ class ArchitecturePage(BasePage):
 
         map_page = QWidget(); map_layout = QVBoxLayout(map_page); map_layout.setContentsMargins(0, 0, 0, 0); map_layout.setSpacing(8)
         map_toolbar = QHBoxLayout(); map_toolbar.setSpacing(8)
-        map_hint = QLabel("AWS service concept map · layers represent the runtime path · hover a service or path for discovered members and relationships")
+        map_hint = QLabel("VPC-aware architecture map · nested regions and network scopes use AWS metadata only · hover components or paths for evidence")
         map_hint.setObjectName("footerText"); map_toolbar.addWidget(map_hint); map_toolbar.addStretch()
         self.export_png = QPushButton("EXPORT PNG"); self.export_png.setObjectName("quietButton"); self.export_png.setMinimumHeight(34); self.export_png.setEnabled(False)
         map_toolbar.addWidget(self.export_png)
@@ -2584,7 +3100,8 @@ class ArchitecturePage(BasePage):
         if graph.warnings:
             warning_text = " · ".join(graph.warnings[:3])
             if len(graph.warnings) > 3: warning_text += f" · +{len(graph.warnings)-3} more"
-        self.status_detail.setText(f"Regions: {', '.join(graph.regions) or '—'} · Tagged applications: {len(graph.applications(tag_key))} · {warning_text or 'No discovery warnings.'}")
+        source_text = " · ".join(graph.discovery_sources) or "Live AWS service discovery"
+        self.status_detail.setText(f"Regions: {', '.join(graph.regions) or '—'} · {source_text} · Tagged applications: {len(graph.applications(tag_key))} · {warning_text or 'No discovery warnings.'}")
 
     def _tag_key_changed(self, _value):
         if self.graph:
@@ -2618,19 +3135,23 @@ class ArchitecturePage(BasePage):
     def clear_view(self):
         self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.inventory_count.setText("0 / 0 resources"); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("CONCEPT MAP"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.resource_export.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
 
+        # Keep the VPC-aware topology as the default after clearing a view.
+        self.map_detail.setCurrentText("ARCHITECTURE MAP")
+
     @staticmethod
     def _demo_graph():
         from services.discovery.models import InfrastructureGraph, ResourceNode, ResourceEdge
         graph = InfrastructureGraph("000000000000", "demo-account", ["eu-west-1"])
-        def n(i, t, name, app="", region="eu-west-1"):
-            return ResourceNode(i, i if i.startswith("arn:") else None, t, name, region, "000000000000", ({DEFAULT_TAG_KEY: app} if app else {}), {})
+        def n(i, t, name, app="", region="eu-west-1", **metadata):
+            return ResourceNode(i, i if i.startswith("arn:") else None, t, name, region, "000000000000", ({DEFAULT_TAG_KEY: app} if app else {}), metadata)
         for item in [
-            n("vpc-01", "VPC", "vpc-prod"), n("subnet-public", "Subnet", "public-a", "payments"),
-            n("alb-01", "ALB", "payments-alb", "payments"), n("listener-01", "Listener", "HTTPS:443", "payments"),
-            n("tg-01", "TargetGroup", "payments-tg", "payments"), n("i-01", "EC2", "payments-01", "payments"),
-            n("rds-01", "RDS", "payments-db", "payments"), n("tgw-01", "TransitGateway", "shared-tgw"),
+            n("vpc-01", "VPC", "vpc-prod", CidrBlock="10.20.0.0/16"), n("subnet-public", "Subnet", "public-a", "payments", VpcId="vpc-01", AvailabilityZone="eu-west-1a", CidrBlock="10.20.1.0/24"),
+            n("alb-01", "ALB", "payments-alb", "payments", VpcId="vpc-01", Scheme="internet-facing"), n("listener-01", "Listener", "HTTPS:443", "payments"),
+            n("tg-01", "TargetGroup", "payments-tg", "payments", VpcId="vpc-01", Port=443), n("i-01", "EC2", "payments-01", "payments", VpcId="vpc-01", SubnetId="subnet-public", AvailabilityZone="eu-west-1a", InstanceType="t3.medium"),
+            n("eni-01", "NetworkInterface", "eni-01", "payments", VpcId="vpc-01", SubnetId="subnet-public", PrivateIp="10.20.1.24", AttachmentInstanceId="i-01"),
+            n("rds-01", "RDS", "payments-db", "payments", VpcId="vpc-01", Engine="postgres"), n("tgw-01", "TransitGateway", "shared-tgw"),
         ]: graph.add_node(item)
-        for e in [("vpc-01","subnet-public","contains"),("subnet-public","alb-01","contains"),("alb-01","listener-01","contains"),("listener-01","tg-01","targets"),("tg-01","i-01","targets"),("i-01","rds-01","depends_on"),("i-01","tgw-01","routes_to")]: graph.add_edge(ResourceEdge(*e))
+        for e in [("vpc-01","subnet-public","contains"),("subnet-public","alb-01","contains"),("alb-01","listener-01","contains"),("listener-01","tg-01","targets"),("tg-01","i-01","targets"),("eni-01","i-01","attached_to"),("i-01","rds-01","depends_on"),("i-01","tgw-01","routes_to")]: graph.add_edge(ResourceEdge(*e))
         return graph
 
 
@@ -2764,7 +3285,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    get_logger()
+    reset_logging_session()
     logger.info("Application starting | log_file=%s", log_path())
     parser=argparse.ArgumentParser(); parser.add_argument("--demo",action="store_true"); args=parser.parse_args()
     app=QApplication([]); app.setStyle("Fusion"); app.setStyleSheet(STYLE); app.setFont(QFont("Segoe UI",10))

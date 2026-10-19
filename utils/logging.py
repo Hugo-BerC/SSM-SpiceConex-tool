@@ -50,6 +50,32 @@ def configure_logging() -> logging.Logger:
     return logger
 
 
+def reset_logging_session() -> logging.Logger:
+    """Begin a new application-session log without keeping stale entries.
+
+    Module imports initialise logging before the Qt entry point runs, so the
+    reset deliberately lives here and is called once from ``main``.  Closing
+    handlers first is essential on Windows, where an open handler prevents the
+    active file from being replaced or deleted.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    for handler in list(logger.handlers):
+        handler.flush()
+        handler.close()
+        logger.removeHandler(handler)
+
+    directory = _resolve_log_dir()
+    try:
+        for previous_log in directory.glob(f"{LOG_FILENAME}*"):
+            if previous_log.is_file():
+                previous_log.unlink()
+    except OSError:
+        # Logging must never prevent SpiceConex from starting.  The fresh
+        # active log will still be created below when the directory allows it.
+        pass
+    return configure_logging()
+
+
 def get_logger(name: str | None = None) -> logging.Logger:
     configure_logging()
     return logging.getLogger(LOGGER_NAME if not name else f"{LOGGER_NAME}.{name}")

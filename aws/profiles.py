@@ -1,6 +1,7 @@
 from __future__ import annotations
 import configparser
 import os
+from pathlib import Path
 from aws.cli import run_aws_cli
 
 def _read(path):
@@ -13,11 +14,20 @@ def _read(path):
         return path, parser, f"{path}: {exc}"
     return path, parser, None
 
+def _aws_paths() -> tuple[str, str]:
+    aws_dir = Path.home() / ".aws"
+    config = Path(os.environ.get("AWS_CONFIG_FILE", aws_dir / "config")).expanduser()
+    credentials = Path(os.environ.get("AWS_SHARED_CREDENTIALS_FILE", aws_dir / "credentials")).expanduser()
+    return str(config), str(credentials)
+
+
 def read_aws_config():
-    return _read(os.path.expanduser("~/.aws/config"))
+    config, _ = _aws_paths()
+    return _read(config)
 
 def read_aws_credentials():
-    return _read(os.path.expanduser("~/.aws/credentials"))
+    _, credentials = _aws_paths()
+    return _read(credentials)
 
 def profile_name_from_section(section):
     return "default" if section == "default" else section.removeprefix("profile ")

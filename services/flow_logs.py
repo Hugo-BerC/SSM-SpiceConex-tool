@@ -184,7 +184,10 @@ def _insights_parse_expression(log_format: str) -> str:
     if not REQUIRED_FIELDS.issubset(fields):
         missing = ", ".join(sorted(REQUIRED_FIELDS - set(fields)))
         raise RuntimeError(f"The Flow Log format does not contain the required fields: {missing}.")
-    captures = "\\s+".join(f"(?<{field.replace('-', '_')}>\\S+)" for field in fields)
+    # CloudWatch Logs Insights can auto-discover fields such as ``bytes``.
+    # Named captures cannot redefine those ephemeral fields, so parser fields
+    # always use an application-owned prefix.
+    captures = "\\s+".join(f"(?<flow_{field.replace('-', '_')}>\\S+)" for field in fields)
     # Logs Insights commands following ``fields`` must be pipe-separated.  In
     # particular, a bare ``parse`` at the start of a second line raises
     # MalformedQueryException ("unexpected symbol" at line 2, position 0).
@@ -193,18 +196,18 @@ def _insights_parse_expression(log_format: str) -> str:
 
 def build_insights_query(log_format: str, interface_id: str = "", limit: int = 10000, aggregation: str = "service") -> str:
     parse = _insights_parse_expression(log_format)
-    interface_filter = f" and interface_id = '{interface_id}'" if interface_id else ""
+    interface_filter = f" and flow_interface_id = '{interface_id}'" if interface_id else ""
     if aggregation == "endpoint":
-        stats = "| stats count(*) as observations, sum(bytes) as bytes, count_distinct(dstport) as port_count by srcaddr, dstaddr, protocol, action"
+        stats = "| stats count(*) as observations, sum(flow_bytes) as total_bytes, count_distinct(flow_dstport) as port_count by flow_srcaddr, flow_dstaddr, flow_protocol, flow_action"
     else:
         # Keep both ports.  The application can then collapse the two halves
         # of a client/server conversation without treating client ephemeral
         # ports as distinct application services.
-        stats = "| stats count(*) as observations, sum(bytes) as bytes by srcaddr, dstaddr, srcport, dstport, protocol, action"
+        stats = "| stats count(*) as observations, sum(flow_bytes) as total_bytes by flow_srcaddr, flow_dstaddr, flow_srcport, flow_dstport, flow_protocol, flow_action"
     return "\n".join([
         "fields @message",
         parse,
-        f"| filter log_status = 'OK' and action in ['ACCEPT', 'REJECT']{interface_filter}",
+        f"| filter flow_log_status = 'OK' and flow_action in ['ACCEPT', 'REJECT']{interface_filter}",
         stats,
         "| sort observations desc",
         f"| limit {max(1, min(int(limit), 10000))}",
@@ -261,30 +264,35 @@ def _rows(results: list[list[dict]], networks, interface_ips=(), normalise_ports
     selected = {address for address in interface_ips if address}
     for result in results:
         item = {field["field"]: field.get("value", "") for field in result}
-        source, destination = item.get("srcaddr", ""), item.get("dstaddr", "")
+        # Accept collision-safe aliases from the current query and historical
+        # field names so already-exported query output remains readable.
+        def value(name: str, default: str = ""):
+            return item.get(f"flow_{name}", item.get(name, default))
+
+        source, destination = value("srcaddr"), value("dstaddr")
         if not source or not destination:
             continue
         count = int(item.get("observations", "0") or 0)
         observations += count
-        port = item.get("dstport", "")
+        port = value("dstport")
         if not port and item.get("port_count"):
             port = f"MULTI ({item['port_count']})"
-        if not normalise_ports and item.get("srcport") and item.get("dstport"):
-            port = f"{item['srcport']} → {item['dstport']}"
+        if not normalise_ports and value("srcport") and value("dstport"):
+            port = f"{value('srcport')} → {value('dstport')}"
         raw_row = {
-            "Origin": source, "Destination": destination, "Protocol": item.get("protocol", ""),
-            "Port": port, "Result": item.get("action", ""),
+            "Origin": source, "Destination": destination, "Protocol": value("protocol"),
+            "Port": port, "Result": value("action"),
             "Direction": _direction(source, destination, networks, interface_ips),
             "Scope": "INTERNAL" if _inside(source, networks) and _inside(destination, networks) else "EXTERNAL",
             "Observations": count,
-            "Bytes": int(item.get("bytes", "0") or 0),
+            "Bytes": _integer(item.get("total_bytes", item.get("bytes", "0"))),
             "RawGroups": 1,
         }
-        if not normalise_ports or not selected or not item.get("srcport") or not item.get("dstport"):
+        if not normalise_ports or not selected or not value("srcport") or not value("dstport"):
             rows.append(raw_row)
             continue
 
-        src_port, dst_port = item["srcport"], item["dstport"]
+        src_port, dst_port = value("srcport"), value("dstport")
         local_source, local_destination = source in selected, destination in selected
         if local_destination:
             origin, destination_value, service_port, direction = source, destination, dst_port, "INBOUND"
@@ -297,14 +305,14 @@ def _rows(results: list[list[dict]], networks, interface_ips=(), normalise_ports
         else:
             origin, destination_value, service_port, direction = source, destination, dst_port, raw_row["Direction"]
         scope = "INTERNAL" if _inside(origin, networks) and _inside(destination_value, networks) else "EXTERNAL"
-        key = (origin, destination_value, item.get("protocol", ""), str(service_port), item.get("action", ""), direction, scope)
+        key = (origin, destination_value, value("protocol"), str(service_port), value("action"), direction, scope)
         target = normalised.setdefault(key, {
-            "Origin": origin, "Destination": destination_value, "Protocol": item.get("protocol", ""),
+            "Origin": origin, "Destination": destination_value, "Protocol": value("protocol"),
             "Port": str(service_port), "Result": item.get("action", ""), "Direction": direction,
             "Scope": scope, "Observations": 0, "Bytes": 0, "RawGroups": 0,
         })
         target["Observations"] += count
-        target["Bytes"] += _integer(item.get("bytes", "0"))
+        target["Bytes"] += _integer(item.get("total_bytes", item.get("bytes", "0")))
         target["RawGroups"] += 1
     if normalise_ports:
         rows.extend(normalised.values())

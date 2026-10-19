@@ -87,18 +87,20 @@ class FlowLogTests(unittest.TestCase):
     def test_query_groups_by_connection_dimensions_not_raw_events(self):
         query = build_insights_query("${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}")
         self.assertIn("\n| parse @message /", query)
+        self.assertIn("(?<flow_bytes>", query)
+        self.assertNotIn("(?<bytes>", query)
         self.assertIn("stats count(*) as observations", query)
-        self.assertIn("by srcaddr, dstaddr, srcport, dstport, protocol, action", query)
-        self.assertIn("log_status = 'OK'", query)
+        self.assertIn("by flow_srcaddr, flow_dstaddr, flow_srcport, flow_dstport, flow_protocol, flow_action", query)
+        self.assertIn("flow_log_status = 'OK'", query)
 
     def test_query_scopes_results_to_the_selected_interface(self):
         query = build_insights_query("${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}", "eni-123")
-        self.assertIn("interface_id = 'eni-123'", query)
+        self.assertIn("flow_interface_id = 'eni-123'", query)
 
     def test_endpoint_grouping_consolidates_ephemeral_destination_ports(self):
         query = build_insights_query("${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}", aggregation="endpoint")
-        self.assertIn("count_distinct(dstport) as port_count", query)
-        self.assertNotIn("by srcaddr, dstaddr, protocol, dstport, action", query)
+        self.assertIn("count_distinct(flow_dstport) as port_count", query)
+        self.assertNotIn("by flow_srcaddr, flow_dstaddr, flow_protocol, flow_dstport, flow_action", query)
 
     def test_rows_classify_inbound_outbound_and_keep_minimal_display_columns(self):
         networks = [ipaddress.ip_network("10.0.0.0/16")]

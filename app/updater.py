@@ -17,12 +17,18 @@ from packaging.version import InvalidVersion, Version
 
 try:
     from app.config import APP_VERSION, GITHUB_BRANCH, GITHUB_REPOSITORY
+    from app.installation import active_installation_problem
 except ModuleNotFoundError:
     # The coordinator is copied to a temporary directory before it updates the
     # checkout, where the package is deliberately unavailable.
     APP_VERSION = "0.0.0"
     GITHUB_BRANCH = "main"
     GITHUB_REPOSITORY = ""
+
+    def active_installation_problem(_app_dir: Path) -> None:
+        # The detached coordinator has already been launched by the active
+        # application; its only responsibility is to finish that update.
+        return None
 
 
 @dataclass(frozen=True)
@@ -93,6 +99,15 @@ def latest_published_target(repository: str) -> UpdateTarget | None:
 
 def check_for_update(app_dir: Path, repository: str = GITHUB_REPOSITORY, branch: str = GITHUB_BRANCH, installed_version: str = APP_VERSION) -> dict:
     """Return a UI-ready update status without altering local state."""
+    installation_problem = active_installation_problem(app_dir)
+    if installation_problem:
+        return {
+            "available": False,
+            "installed_version": installed_version,
+            "available_version": None,
+            "can_apply": False,
+            "reason": installation_problem,
+        }
     if not shutil.which("git"):
         raise RuntimeError("Git is not installed. Run setup.sh to install it.")
     if not is_git_worktree(app_dir):
@@ -152,7 +167,7 @@ def apply_update(app_dir: Path, branch: str = GITHUB_BRANCH, tag: str | None = N
                 time.sleep(0.25)
             if _process_alive(pid):
                 raise RuntimeError("SpiceConex did not close within 30 seconds; update cancelled.")
-        problem = _working_tree_problem(app_dir, branch)
+        problem = active_installation_problem(app_dir) or _working_tree_problem(app_dir, branch)
         if problem:
             raise RuntimeError(problem)
         if not tag:

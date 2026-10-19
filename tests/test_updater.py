@@ -40,6 +40,13 @@ class VersionTests(unittest.TestCase):
 
 
 class UpdateSafetyTests(unittest.TestCase):
+    def test_non_active_copy_cannot_offer_an_update(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(updater, "active_installation_problem", return_value="not the active installation"):
+            result = updater.check_for_update(Path(directory))
+        self.assertFalse(result["available"])
+        self.assertFalse(result["can_apply"])
+        self.assertIn("not the active installation", result["reason"])
+
     def test_coordinator_restarts_after_successful_update(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(sys, "argv", ["updater.py", "--apply", directory, "main", "v1.0.0", "123"]), \

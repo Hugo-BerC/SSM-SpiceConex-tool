@@ -2,6 +2,8 @@
 set -eu
 
 APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+RUNTIME_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/SSM-SpiceConex"
+ACTIVE_INSTALL_FILE="$RUNTIME_ROOT/active-installation.json"
 MIN_PY_MAJOR=3
 MIN_PY_MINOR=10
 PLUGIN_MIN_VERSION="1.2.764.0"
@@ -204,6 +206,25 @@ PREFIX="/usr/local/bin"
 run_as_root mkdir -p "$PREFIX"
 run_as_root cp "$APP_DIR/spiceconex" "$PREFIX/spiceconex"
 run_as_root chmod 755 "$PREFIX/spiceconex"
+mkdir -p "$RUNTIME_ROOT"
+"$VENV_PY" - "$ACTIVE_INSTALL_FILE" "$APP_DIR" "$VENV_PY" "$PREFIX/spiceconex" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+manifest, app_dir, python, launcher = map(Path, sys.argv[1:])
+payload = {
+    "schema": 1,
+    "app_dir": str(app_dir),
+    "python": str(python),
+    "launcher": str(launcher),
+    "installed_at_utc": datetime.now(timezone.utc).isoformat(),
+}
+temporary = manifest.with_suffix(".tmp")
+temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+temporary.replace(manifest)
+PY
 
 printf '\n========================================\n'
 printf ' SPICECONEX READY\n'

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="sidebar_logo.png" alt="SSM-SpiceConex logo" width="460">
+  <img src="sidebar_logo.png" alt="SpiceConex logo" width="460">
 </p>
 
-<h1 align="center">SSM-SpiceConex</h1>
+<h1 align="center">SpiceConex</h1>
 <p align="center"><strong>AWS operations cockpit for SRE / Cloud Engineering</strong><br>EC2 · SSM · Tunneling · Commands · Performance · Connectivity · Certificates · Architecture</p>
 
 ---
@@ -13,19 +13,19 @@
 
 ## What is it?
 
-**SSM-SpiceConex** is a cross-platform PySide6 desktop utility for day-to-day AWS operations. It puts the common EC2 / Systems Manager workflows behind a single operator-oriented interface with an Arrakis-inspired visual language.
+**SpiceConex** is a cross-platform PySide6 desktop utility for day-to-day AWS operations. It puts the common EC2 / Systems Manager workflows behind a single operator-oriented interface with an Arrakis-inspired visual language.
 
 The architecture discovery module builds a deterministic AWS resource graph first, then projects it into a readable architecture view. The full inventory remains available for CSV export and later DR / dependency analysis.
 
 ## Current release
 
-**Version:** `0.5.0-dev`
+**Version:** `0.5.1`
 
 **Update channel:** `main` (Git)
 
-> The in-app updater is intentionally conservative: it only accepts  semantic-version Git tags, refuses to overwrite local changes, prepares Python dependencies before changing source files, and restarts SpiceConex.
+> The in-app updater is intentionally conservative: it only accepts semantic-version Git tags, refuses to overwrite local changes, prepares Python dependencies before changing source files, and restarts SpiceConex.
 
-## Installati
+## Installation
 The bootstrapper detects the host platform and installs the local tooling required by SpiceConex:
 
 - Python 3.10+
@@ -134,6 +134,8 @@ spiceconex
 
 The application does not store AWS credentials, access keys, SSO tokens or IAM secrets.
 
+The in-app **Configure profiles** workflow uses bootstrap credentials only in memory to query AWS Organizations. It merges generated `sso-session` profiles into the selected AWS config file, preserves unrelated profiles and never writes to the AWS shared credentials file.
+
 ## Interactive SSM terminals
 
 Terminal launch is platform-aware:
@@ -157,6 +159,12 @@ The AWS command itself remains the standard `aws ssm start-session` flow; the te
 | **Connectivity** | Connectivity CSV validation and endpoint checks |
 | **Certificates** | ACM inventory, load-balancer correlation and filtered CSV export |
 | **Architecture** | Deterministic AWS discovery, resource inventory and architecture projection |
+
+### Operational safeguards
+
+- Run Command requires an explicit confirmation showing the AWS context, selected instances and command. A single operation is limited to 50 targets and is submitted as one auditable SSM command.
+- Every CSV export is protected against spreadsheet formula injection while preserving the visible values in the application.
+- Long AWS validation and discovery operations run outside the Qt interface thread so the UI remains responsive while SSO or AWS APIs are resolving.
 
 ### Architecture discovery
 
@@ -217,7 +225,7 @@ requirements.txt      Runtime Python dependencies
 
 ## Version history
 
-### 0.5.0-dev — current
+### 0.5.0 — current
 
 - Cross-platform terminal launcher redesign.
 - Windows Terminal sessions use new tabs where available.

@@ -37,6 +37,7 @@ class InfrastructureGraph:
     nodes: dict[str, ResourceNode] = field(default_factory=dict)
     edges: list[ResourceEdge] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    discovery_sources: list[str] = field(default_factory=list)
 
     def add_node(self, node: ResourceNode) -> None:
         self.nodes[node.id] = node
@@ -83,6 +84,7 @@ class InfrastructureGraph:
             account_name=self.account_name,
             regions=list(self.regions),
             warnings=list(self.warnings),
+            discovery_sources=list(self.discovery_sources),
         )
         for node_id in selected:
             result.add_node(self.nodes[node_id])

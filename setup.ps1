@@ -4,6 +4,8 @@ $ProgressPreference = 'SilentlyContinue'
 $AppDir = (Resolve-Path $PSScriptRoot).Path
 $RuntimeRoot = Join-Path $env:LOCALAPPDATA 'SSM-SpiceConex'
 $VenvDir = Join-Path $RuntimeRoot 'venv'
+$LauncherDir = Join-Path $RuntimeRoot 'bin'
+$ActiveInstallFile = Join-Path $RuntimeRoot 'active-installation.json'
 $PluginMinVersion = [version]'1.2.764.0'
 
 function Write-Step {
@@ -230,18 +232,35 @@ Run-Quiet 'Installing Python package manager' $VenvPython @('-m','pip','install'
 Run-Quiet 'Installing SpiceConex Python modules' $VenvPython @('-m','pip','install','-r',(Join-Path $AppDir 'requirements.txt'),'--disable-pip-version-check','--no-input')
 
 # Launcher
-$CmdPath = Join-Path $AppDir 'spiceconex.cmd'
+$CmdPath = Join-Path $LauncherDir 'spiceconex.cmd'
 $LauncherTarget = Join-Path $AppDir 'ssm_spiceconex.py'
+New-Item -ItemType Directory -Force -Path $LauncherDir | Out-Null
 $launcherText = '@echo off' + [Environment]::NewLine + '"' + $VenvPython + '" "' + $LauncherTarget + '" %*' + [Environment]::NewLine
 [IO.File]::WriteAllText($CmdPath, $launcherText, [Text.Encoding]::ASCII)
 
 $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $entries = @()
 if ($UserPath) { $entries = $UserPath -split ';' | Where-Object { $_ -and $_.Trim() } }
-if ($entries -notcontains $AppDir) {
-    [Environment]::SetEnvironmentVariable('Path', (($entries + $AppDir) -join ';'), 'User')
+$PreviousAppDir = $null
+if (Test-Path $ActiveInstallFile) {
+    try { $PreviousAppDir = (Get-Content $ActiveInstallFile -Raw | ConvertFrom-Json).app_dir } catch {}
 }
-$env:Path = $AppDir + ';' + $env:Path
+$entries = @($entries | Where-Object { $_ -ne $AppDir -and $_ -ne $PreviousAppDir })
+if ($entries -notcontains $LauncherDir) {
+    $entries += $LauncherDir
+}
+[Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
+$currentEntries = @($env:Path -split ';' | Where-Object { $_ -ne $AppDir -and $_ -ne $PreviousAppDir } | Select-Object -Unique)
+$env:Path = (@($LauncherDir) + $currentEntries) -join ';'
+
+$activeInstall = [ordered]@{
+    schema = 1
+    app_dir = $AppDir
+    python = $VenvPython
+    launcher = $CmdPath
+    installed_at_utc = [DateTime]::UtcNow.ToString('o')
+}
+[IO.File]::WriteAllText($ActiveInstallFile, ($activeInstall | ConvertTo-Json), [Text.Encoding]::UTF8)
 
 Write-Host ''
 Write-Host '========================================' -ForegroundColor DarkYellow
