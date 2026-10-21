@@ -86,43 +86,10 @@ def format_metric_value(value: float) -> str:
     return f"{number:.6f}".rstrip("0").rstrip(".")
 
 
-# The statistic and dimensions are specific to the AWS service.  In
-# particular, ELB-generated errors are never mislabelled as target errors.
+# The DR evidence dashboard deliberately uses the public API boundary as its
+# source of truth. An ALB can also carry east-west traffic between services,
+# therefore its counters cannot be presented as API traffic during a failover.
 TEMPLATES = {
-    "ALB": ("AWS/ApplicationELB", "LoadBalancer", [
-        # These queries use only the LoadBalancer dimension.  Do not include
-        # target-group response code metrics in an ALB-level DR comparison.
-        ("RequestCount", "Sum", "ALB requests", "Count"),
-        ("HTTPCode_ELB_4XX_Count", "Sum", "ALB HTTP 4xx / client error", "Count"),
-        ("HTTPCode_ELB_5XX_Count", "Sum", "ALB HTTP 5xx / server error", "Count"),
-        ("TargetResponseTime", "tm99", "ALB target response time / tm99", "Seconds"),
-    ]),
-    "NLB": ("AWS/NetworkELB", "LoadBalancer", [
-        ("NewFlowCount", "Sum", "New connections", "Count"),
-        ("ActiveFlowCount", "Average", "Active connections", "Count"),
-        ("ProcessedBytes", "Sum", "Processed bytes", "Bytes"),
-    ]),
-    "EC2": ("AWS/EC2", "InstanceId", [
-        ("NetworkIn", "Sum", "Instance network in", "Bytes"),
-        ("NetworkOut", "Sum", "Instance network out", "Bytes"),
-        ("CPUUtilization", "Average", "CPU utilization", "Percent"),
-        ("StatusCheckFailed", "Maximum", "Instance status check failed", "Count"),
-    ]),
-    "Lambda": ("AWS/Lambda", "FunctionName", [
-        ("Invocations", "Sum", "Invocations", "Count"),
-        ("Errors", "Sum", "Function errors", "Count"),
-        ("Throttles", "Sum", "Throttled invocations", "Count"),
-        ("Duration", "Average", "Duration", "Milliseconds"),
-    ]),
-    "RDS": ("AWS/RDS", "DBInstanceIdentifier", [
-        ("DatabaseConnections", "Average", "Database client connections", "Count"),
-        ("CPUUtilization", "Average", "CPU utilization", "Percent"),
-        ("ReadLatency", "Average", "Read latency", "Seconds"),
-        ("WriteLatency", "Average", "Write latency", "Seconds"),
-    ]),
-    "EFS": ("AWS/EFS", "FileSystemId", [
-        ("TotalIOBytes", "Sum", "Total file system I/O", "Bytes"),
-    ]),
     "APIGateway": ("AWS/ApiGateway", "ApiName", [
         ("Count", "SampleCount", "API calls", "Count"),
         ("Latency", "tm99", "Response time / tm99", "Milliseconds"),
@@ -140,23 +107,6 @@ TEMPLATES = {
 
 
 def _dimension_value(node: ResourceNode) -> str:
-    if node.resource_type in {"ALB", "NLB"}:
-        arn = node.arn or node.id
-        prefix = "app/" if node.resource_type == "ALB" else "net/"
-        resource = arn.split(":loadbalancer/", 1)[-1] if ":loadbalancer/" in arn else ""
-        return resource if resource.startswith(prefix) and len(resource.split("/")) == 3 else ""
-    if node.resource_type == "EC2":
-        return node.id if node.id.startswith("i-") else ""
-    if node.resource_type == "EFS":
-        return node.id if node.id.startswith("fs-") else ""
-    if node.resource_type == "Lambda":
-        if node.arn and ":function:" in node.arn:
-            return node.arn.split(":function:", 1)[1].split(":", 1)[0]
-        return node.name or ""
-    if node.resource_type == "RDS":
-        if node.arn and ":db:" in node.arn:
-            return node.arn.split(":db:", 1)[1]
-        return node.name or ""
     if node.resource_type == "APIGateway":
         return node.name or ""
     if node.resource_type == "APIGatewayV2":
@@ -492,7 +442,7 @@ def _svg_line_chart(title: str, unit: str, regions: tuple[str, str], regional_re
 <text x="{left}" y="{height - 10}" class="tick">UTC {datetime.fromtimestamp(min_time, timezone.utc).strftime('%H:%M')}</text><text x="{left + plot_width - 72}" y="{height - 10}" class="tick">UTC {datetime.fromtimestamp(max_time, timezone.utc).strftime('%H:%M')}</text>{paths}</svg></figure>'''
 
 
-def render_html_report(profile: str, account: str, application: str, regions: tuple[str, str], start: datetime, end: datetime, results: list[MetricResult]) -> str:
+def render_html_report(profile: str, account: str, application: str, regions: tuple[str, str], start: datetime, end: datetime, results: list[MetricResult], period: int = 60) -> str:
     """Create a self-contained, evidence-oriented comparison report.
 
     Values are derived only from returned CloudWatch points. In particular,
@@ -530,10 +480,10 @@ def render_html_report(profile: str, account: str, application: str, regions: tu
                     cells.append(f"<td><strong>Mean: {format_metric_value(mean)} {escape(unit)}</strong><br><small>Min: {format_metric_value(min(points))} | Max: {format_metric_value(max(points))} | Samples: {len(points)} | {note}</small></td>")
             rows.append(f"<tr><th>{escape(label)}</th>{''.join(cells)}</tr>")
         charts = []
-        if resource_type == "ALB":
+        if resource_type in {"APIGateway", "APIGatewayV2"}:
             for metric_name, chart_title, chart_unit in (
-                ("RequestCount", "ALB request count", "requests per period"),
-                ("TargetResponseTime", "ALB target response time / tm99", "seconds"),
+                ("Count", "API Gateway calls", f"calls per {period}-second period"),
+                ("Latency", "API Gateway response time / tm99", "milliseconds"),
             ):
                 regional_results = {
                     region: [item for item in comparison_results if item.metric.name == metric_name and item.metric.region == region]
@@ -544,7 +494,7 @@ def render_html_report(profile: str, account: str, application: str, regions: tu
     return f"""<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{escape(profile)} - Disaster Recovery</title>
 <style>body{{background:#0b1010;color:#e8e1d3;font:14px Segoe UI,Arial,sans-serif;margin:32px}}h1{{color:#e0b66d}}h2{{color:#e0b66d;margin:0 0 12px}}section{{background:#111818;border:1px solid #394241;padding:18px;margin:18px 0}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #394241;padding:10px;text-align:left;vertical-align:top}}th{{background:#171f1f;color:#e0b66d}}small{{color:#abb3ad}}.notice,.chart-empty{{color:#cfaa78}}.chart{{border:1px solid #2d3938;background:#0d1414;padding:14px;margin:16px 0}}.chart figcaption{{font-weight:700;color:#e0b66d;margin-bottom:7px}}.legend{{display:flex;gap:18px;margin:0 0 7px;color:#abb3ad;font-size:12px}}.legend i{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}}svg{{width:100%;height:auto;background:#0b1010}}.axis{{stroke:#475351;stroke-width:1}}.tick{{fill:#abb3ad;font-size:11px}}</style></head><body>
 <h1>{escape(profile)} — Disaster Recovery evidence</h1><p>Account: <strong>{escape(account)}</strong> · Application: <strong>{escape(application)}</strong><br>Source: <strong>{escape(regions[0])}</strong> · DR: <strong>{escape(regions[1])}</strong><br>UTC interval: {escape(start.isoformat())} — {escape(end.isoformat())}</p>
-<p class=\"notice\">Native CloudWatch metrics only. Missing data is not zero. Latency labelled tm99 excludes the highest 1% of raw samples where CloudWatch supports it.</p>{''.join(sections)}</body></html>"""
+<p class=\"notice\">API Gateway native metrics only. API calls use SampleCount over {period}-second periods. Missing data is not zero. Latency labelled tm99 excludes the highest 1% of raw samples where CloudWatch supports it.</p>{''.join(sections)}</body></html>"""
 
 
 def publish_new_dashboard(profile: str, account: str, region: str, application: str, body: dict) -> tuple[str, list]:

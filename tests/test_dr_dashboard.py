@@ -29,28 +29,22 @@ class DRDashboardTests(unittest.TestCase):
         self.assertEqual("390,000", format_metric_value(390000))
         self.assertEqual("0.002", format_metric_value(0.00239))
 
-    def test_native_metric_dimensions_and_attribution(self):
+    def test_only_api_gateway_metrics_are_eligible_for_dr_evidence(self):
         nodes = [
-            node("alb", "ALB", arn="arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/edge/abc", tags={TAG: "orders"}),
-            node("nlb", "NLB", REGIONS[1], "arn:aws:elasticloadbalancing:eu-south-2:123456789012:loadbalancer/net/edge/def"),
-            node("i-123", "EC2"), node("fs-123", "EFS"), node("unsupported", "ECS"),
+            node("orders-rest", "APIGateway", tags={TAG: "orders"}),
+            node("orders-http", "APIGatewayV2", REGIONS[1], tags={TAG: "orders"}),
+            node("alb", "ALB"), node("i-123", "EC2"), node("unsupported", "ECS"),
         ]
         metrics, skipped = build_metrics(nodes, REGIONS, "orders", TAG)
-        alb = [metric for metric in metrics if metric.resource_type == "ALB"]
-        self.assertTrue(any(m.name == "RequestCount" for m in alb))
-        self.assertTrue(any(m.name == "HTTPCode_ELB_5XX_Count" for m in alb))
-        self.assertFalse(any(m.name.startswith("HTTPCode_Target_") for m in alb))
-        self.assertTrue(all(m.dimension_value == "app/edge/abc" and m.attribution == "TAGGED" for m in alb))
-        nlb = [metric for metric in metrics if metric.resource_type == "NLB"]
-        self.assertTrue(all(m.dimension_value == "net/edge/def" and not m.name.startswith("HTTP") for m in nlb))
-        self.assertTrue(any(m.name == "TotalIOBytes" and m.dimension_value == "fs-123" for m in metrics))
-        self.assertTrue(all(m.attribution == "SHARED / UNTAGGED" for m in nlb))
-        self.assertEqual(1, len(skipped))
+        self.assertEqual({"APIGateway", "APIGatewayV2"}, {metric.resource_type for metric in metrics})
+        self.assertEqual({"Count", "Latency", "4XXError", "5XXError", "4xx", "5xx"}, {metric.name for metric in metrics})
+        self.assertTrue(all(metric.attribution == "TAGGED" for metric in metrics))
+        self.assertEqual(3, len(skipped))
         with self.assertRaises(ValueError):
             build_metrics(nodes, (REGIONS[0], REGIONS[0]))
 
     def test_dashboard_series_regions_and_no_logs(self):
-        metrics, _ = build_metrics([node("i-123", "EC2"), node("i-456", "EC2", REGIONS[1])], REGIONS)
+        metrics, _ = build_metrics([node("api-a", "APIGateway"), node("api-b", "APIGateway", REGIONS[1])], REGIONS)
         body = build_dashboard(ACCOUNT, "all", REGIONS, metrics)
         self.assertTrue(all(widget["type"] in {"text", "metric"} for widget in body["widgets"]))
         widget = next(w for w in body["widgets"] if w["type"] == "metric")
@@ -58,7 +52,7 @@ class DRDashboardTests(unittest.TestCase):
         self.assertTrue(all("ACCOUNT SCOPE" in entry[-1]["label"] for entry in widget["properties"]["metrics"]))
 
     def test_query_distinguishes_missing_result_no_data_and_partial_data(self):
-        metrics, _ = build_metrics([node("i-123", "EC2")], REGIONS)
+        metrics, _ = build_metrics([node("api-a", "APIGateway")], REGIONS)
         session = MagicMock()
         sts = MagicMock(); sts.get_caller_identity.return_value = {"Account": ACCOUNT}
         cloudwatch = MagicMock()
@@ -106,28 +100,27 @@ class DRDashboardTests(unittest.TestCase):
         self.assertTrue(all(len(widget["properties"]["metrics"]) == 2 for widget in widgets))
         self.assertTrue(all({entry[-1]["region"] for entry in widget["properties"]["metrics"]} == set(REGIONS) for widget in widgets))
 
-    def test_ecs_pair_uses_cluster_and_service_dimensions(self):
-        source = node("ecs-a", "ECS", REGIONS[0]); source.name = "orders-a"; source.metadata["ClusterArn"] = "arn:aws:ecs:eu-west-1:123:cluster/source"
-        dr = node("ecs-b", "ECS", REGIONS[1]); dr.name = "orders-b"; dr.metadata["ClusterArn"] = "arn:aws:ecs:eu-south-2:123:cluster/dr"
-        metrics, skipped = build_pair_metrics([ComparisonPair(source, dr, "orders")], REGIONS)
-        self.assertFalse(skipped)
-        self.assertEqual({("ClusterName", "source"), ("ServiceName", "orders-a")}, set(metrics[0].dimensions))
-        self.assertEqual({"CPUUtilization", "MemoryUtilization", "RunningTaskCount"}, {metric.name for metric in metrics})
+    def test_non_api_resources_are_skipped_from_dr_evidence(self):
+        source = node("alb-a", "ALB", REGIONS[0])
+        dr = node("alb-b", "ALB", REGIONS[1])
+        metrics, skipped = build_pair_metrics([ComparisonPair(source, dr, "internal ALB")], REGIONS)
+        self.assertEqual([], metrics)
+        self.assertEqual(2, len(skipped))
 
-    def test_ecs_comparison_set_aggregates_many_services_into_two_regional_series(self):
-        source_a = node("ecs-a", "ECS", REGIONS[0]); source_a.metadata["ClusterArn"] = "arn:aws:ecs:eu-west-1:123:cluster/source"
-        source_b = node("ecs-b", "ECS", REGIONS[0]); source_b.metadata["ClusterArn"] = "arn:aws:ecs:eu-west-1:123:cluster/source"
-        dr_a = node("ecs-dr-a", "ECS", REGIONS[1]); dr_a.metadata["ClusterArn"] = "arn:aws:ecs:eu-south-2:123:cluster/recovery"
-        dr_b = node("ecs-dr-b", "ECS", REGIONS[1]); dr_b.metadata["ClusterArn"] = "arn:aws:ecs:eu-south-2:123:cluster/recovery"
-        selection = ComparisonPair(source_a, dr_a, "ECS services", (source_a, source_b), (dr_a, dr_b))
+    def test_api_comparison_set_aggregates_many_apis_into_two_regional_series(self):
+        source_a = node("api-a", "APIGateway", REGIONS[0])
+        source_b = node("api-b", "APIGateway", REGIONS[0])
+        dr_a = node("api-dr-a", "APIGateway", REGIONS[1])
+        dr_b = node("api-dr-b", "APIGateway", REGIONS[1])
+        selection = ComparisonPair(source_a, dr_a, "public APIs", (source_a, source_b), (dr_a, dr_b))
         metrics, skipped = build_pair_metrics([selection], REGIONS)
         self.assertFalse(skipped)
         body = build_dashboard(ACCOUNT, "orders", REGIONS, metrics)
         widgets = [widget for widget in body["widgets"] if widget["type"] == "metric"]
-        self.assertEqual(3, len(widgets))
+        self.assertEqual(4, len(widgets))
         self.assertTrue(all(len(widget["properties"]["metrics"]) == 6 for widget in widgets))
-        running_tasks = next(widget for widget in widgets if "Running service tasks" in widget["properties"]["title"])
-        self.assertTrue(any("SUM" in item[0].get("expression", "") for item in running_tasks["properties"]["metrics"] if isinstance(item[0], dict)))
+        calls = next(widget for widget in widgets if "API calls" in widget["properties"]["title"])
+        self.assertTrue(any("SUM" in item[0].get("expression", "") for item in calls["properties"]["metrics"] if isinstance(item[0], dict)))
 
     def test_html_report_contains_both_regions_and_no_data(self):
         metrics, _ = build_pair_metrics([ComparisonPair(node("api-a", "APIGateway"), node("api-b", "APIGateway", REGIONS[1]), "API")], REGIONS)
@@ -136,16 +129,16 @@ class DRDashboardTests(unittest.TestCase):
         self.assertIn("profile — Disaster Recovery evidence", report)
         self.assertIn(REGIONS[0], report); self.assertIn(REGIONS[1], report); self.assertIn("NO DATA", report)
 
-    def test_html_report_draws_two_region_alb_request_and_response_charts(self):
-        source = node("alb-source", "ALB", REGIONS[0], "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/source/abc")
-        dr = node("alb-dr", "ALB", REGIONS[1], "arn:aws:elasticloadbalancing:eu-south-2:123456789012:loadbalancer/app/dr/def")
-        metrics, _ = build_pair_metrics([ComparisonPair(source, dr, "public ALB")], REGIONS)
-        selected = [metric for metric in metrics if metric.name in {"RequestCount", "TargetResponseTime"}]
+    def test_html_report_draws_two_region_api_gateway_charts(self):
+        source = node("api-source", "APIGateway", REGIONS[0])
+        dr = node("api-dr", "APIGateway", REGIONS[1])
+        metrics, _ = build_pair_metrics([ComparisonPair(source, dr, "public API")], REGIONS)
+        selected = [metric for metric in metrics if metric.name in {"Count", "Latency"}]
         now = datetime.now(timezone.utc)
         results = [MetricResult(metric, "DATA", [(now - timedelta(minutes=5), 5.0), (now, 8.0)]) for metric in selected]
         report = render_html_report("profile", ACCOUNT, "orders", REGIONS, now - timedelta(minutes=10), now, results)
-        self.assertIn("ALB request count", report)
-        self.assertIn("ALB target response time / tm99", report)
+        self.assertIn("API Gateway calls", report)
+        self.assertIn("API Gateway response time / tm99", report)
         self.assertIn("<svg", report)
 
     def test_discovery_queries_only_selected_regions(self):
@@ -166,18 +159,18 @@ class DRPageTests(unittest.TestCase):
 
     def test_scope_defaults_and_stale_results_are_discarded(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
-        graph.add_node(node("i-111", "EC2", tags={TAG: "orders"}))
-        graph.add_node(node("i-222", "EC2", REGIONS[1]))
-        graph.add_edge(ResourceEdge("i-111", "i-222", "connected"))
+        graph.add_node(node("api-111", "APIGateway", tags={TAG: "orders"}))
+        graph.add_node(node("api-222", "APIGateway", REGIONS[1]))
+        graph.add_edge(ResourceEdge("api-111", "api-222", "connected"))
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.preferred_regions = REGIONS
         page.set_context(graph, "orders", TAG)
         self.assertEqual(REGIONS, (page.region_a.currentText(), page.region_b.currentText()))
         states = {page.resources.item(i, 3).text(): page.resources.item(i, 0).checkState() for i in range(page.resources.rowCount())}
-        self.assertEqual(Qt.CheckState.Unchecked, states["i-111"])
-        self.assertEqual(Qt.CheckState.Unchecked, states["i-222"])
+        self.assertEqual(Qt.CheckState.Unchecked, states["api-111"])
+        self.assertEqual(Qt.CheckState.Unchecked, states["api-222"])
         old_revision = page._revision
-        shared_row = next(i for i in range(page.resources.rowCount()) if page.resources.item(i, 3).text() == "i-222")
+        shared_row = next(i for i in range(page.resources.rowCount()) if page.resources.item(i, 3).text() == "api-222")
         page.resources.item(shared_row, 0).setCheckState(Qt.CheckState.Checked)
         page._prepared({"context": page.context_key, "profile": "profile", "revision": old_revision})
         self.assertIsNone(page.prepared)
@@ -185,7 +178,7 @@ class DRPageTests(unittest.TestCase):
 
     def test_region_catalogue_is_available_but_undiscovered_region_is_blocked(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", [REGIONS[0]])
-        graph.add_node(node("i-111", "EC2"))
+        graph.add_node(node("api-111", "APIGateway"))
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.set_context(graph, "ALL PRODUCTS", TAG)
         self.assertGreaterEqual(page.region_b.count(), 3)
@@ -195,30 +188,30 @@ class DRPageTests(unittest.TestCase):
 
     def test_resource_filters_hide_rows_without_losing_selection(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
-        graph.add_node(node("i-api-01", "EC2", tags={TAG: "orders"}))
-        graph.add_node(node("fs-data-01", "EFS", REGIONS[1]))
+        graph.add_node(node("orders-rest", "APIGateway", tags={TAG: "orders"}))
+        graph.add_node(node("orders-http", "APIGatewayV2", REGIONS[1]))
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.set_context(graph, "ALL PRODUCTS", TAG)
-        page.resource_filter.setText("fs-data")
+        page.resource_filter.setText("orders-http")
         visible_rows = [row for row in range(page.resources.rowCount()) if not page.resources.isRowHidden(row)]
         self.assertEqual(1, len(visible_rows))
-        self.assertEqual("fs-data-01", page.resources.item(visible_rows[0], 3).text())
-        page.resource_filter.clear(); page.resource_type_filter.setCurrentText("EC2")
+        self.assertEqual("orders-http", page.resources.item(visible_rows[0], 3).text())
+        page.resource_filter.clear(); page.resource_type_filter.setCurrentText("APIGateway")
         self.assertEqual(1, sum(not page.resources.isRowHidden(row) for row in range(page.resources.rowCount())))
-        ec2_row = next(row for row in range(page.resources.rowCount()) if page.resources.item(row, 3).text() == "i-api-01")
-        page.resources.item(ec2_row, 0).setCheckState(Qt.CheckState.Checked)
+        api_row = next(row for row in range(page.resources.rowCount()) if page.resources.item(row, 3).text() == "orders-rest")
+        page.resources.item(api_row, 0).setCheckState(Qt.CheckState.Checked)
         page.selected_only.setChecked(True)
         self.assertEqual(1, sum(not page.resources.isRowHidden(row) for row in range(page.resources.rowCount())))
-        self.assertEqual(Qt.CheckState.Checked, page.resources.item(ec2_row, 0).checkState())
+        self.assertEqual(Qt.CheckState.Checked, page.resources.item(api_row, 0).checkState())
 
     def test_dr_resource_selector_hides_raw_aws_config_types(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
-        graph.add_node(node("i-111", "EC2"))
+        graph.add_node(node("api-111", "APIGateway"))
         graph.add_node(node("opaque", "AWS::Unmodelled::Resource", REGIONS[1]))
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.set_context(graph, "ALL PRODUCTS", TAG)
         displayed_types = {page.resources.item(row, 2).text() for row in range(page.resources.rowCount())}
-        self.assertEqual({"EC2"}, displayed_types)
+        self.assertEqual({"APIGateway"}, displayed_types)
 
     def test_dr_resource_selector_deduplicates_config_and_live_api_gateway(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
@@ -236,10 +229,10 @@ class DRPageTests(unittest.TestCase):
 
     def test_user_can_build_explicit_pair_with_different_resource_names(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
-        graph.add_node(node("i-source", "EC2", REGIONS[0]))
-        graph.nodes["i-source"].name = "api-primary"
-        graph.add_node(node("i-dr", "EC2", REGIONS[1]))
-        graph.nodes["i-dr"].name = "api-recovery"
+        graph.add_node(node("api-source", "APIGateway", REGIONS[0]))
+        graph.nodes["api-source"].name = "api-primary"
+        graph.add_node(node("api-dr", "APIGateway", REGIONS[1]))
+        graph.nodes["api-dr"].name = "api-recovery"
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.preferred_regions = REGIONS; page.set_context(graph, "ALL PRODUCTS", TAG)
         for row in range(page.resources.rowCount()): page.resources.item(row, 0).setCheckState(Qt.CheckState.Checked)
@@ -249,12 +242,10 @@ class DRPageTests(unittest.TestCase):
         self.assertEqual(1, page.pairs.rowCount())
         self.assertTrue(all(page.resources.item(row, 0).checkState() == Qt.CheckState.Unchecked for row in range(page.resources.rowCount())))
 
-    def test_user_can_build_a_multi_service_comparison_set(self):
+    def test_user_can_build_a_multi_api_comparison_set(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
-        for identifier, region in (("ecs-source-a", REGIONS[0]), ("ecs-source-b", REGIONS[0]), ("ecs-dr-a", REGIONS[1])):
-            service = node(identifier, "ECS", region)
-            service.metadata["ClusterArn"] = f"arn:aws:ecs:{region}:123:cluster/workloads"
-            graph.add_node(service)
+        for identifier, region in (("api-source-a", REGIONS[0]), ("api-source-b", REGIONS[0]), ("api-dr-a", REGIONS[1])):
+            graph.add_node(node(identifier, "APIGateway", region))
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.preferred_regions = REGIONS; page.set_context(graph, "ALL PRODUCTS", TAG)
         for row in range(page.resources.rowCount()):
@@ -264,7 +255,7 @@ class DRPageTests(unittest.TestCase):
         selection = page.comparison_pairs[0]
         self.assertEqual(2, len(selection.sources))
         self.assertEqual(1, len(selection.drs))
-        self.assertIn("ECS set (2 source / 1 DR)", selection.label)
+        self.assertIn("APIGateway set (2 source / 1 DR)", selection.label)
 
     def test_compact_pair_controls_do_not_consume_table_space_initially(self):
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
@@ -274,10 +265,10 @@ class DRPageTests(unittest.TestCase):
 
     def test_metric_preview_renders_points_and_evidence_context(self):
         graph = InfrastructureGraph(ACCOUNT, "profile", list(REGIONS))
-        instance = node("i-111", "EC2"); graph.add_node(instance)
+        api = node("api-111", "APIGateway"); graph.add_node(api)
         page = DRDashboardPage(lambda: "profile", lambda profile, operation: operation(), lambda exc: None)
         page.set_context(graph, "ALL PRODUCTS", TAG)
-        metrics, _ = build_metrics([instance], REGIONS)
+        metrics, _ = build_metrics([api], REGIONS)
         now = datetime.now(timezone.utc)
         result = MetricResult(metrics[0], "DATA", [(now - timedelta(minutes=5), 2.0)])
         page._prepared({"context": page.context_key, "profile": "profile", "revision": page._revision,
