@@ -187,6 +187,12 @@ Raw discovery
 
 The architecture view deliberately hides low-level implementation resources such as ENIs, security groups, route tables and subnets when they do not improve architectural readability. The full graph remains available for forensic/resource-level inspection.
 
+### DR dashboard (first version)
+
+Select **SELECTED REGIONS** in Architecture, choose the source and recovery regions, and run **DISCOVER** once. The map, resource inventory and **DR DASHBOARD** share that discovery and the application filter. In the DR tab, filter the resources, select one source and one DR resource of the same type, then choose **ADD PAIR FROM SELECTED**. This explicit pair supports different resource names in each region. Prepare metrics for one or more pairs, then export the evidence as self-contained HTML, CSV, PNG or the dashboard definition as JSON. The confirmed CloudWatch action creates or replaces only the explicitly named `{profile}-Disaster_Recovery` dashboard.
+
+The first version covers ALB, NLB, EC2, Lambda, RDS instances and EFS with service-specific native metrics. Other discovered types remain visible but are marked as lacking a template. It does not enable or query access logs or enable additional metrics. A shared resource can include traffic from other applications and is not preselected for an application filter. A missing metric is not treated as zero; incomplete results and errors are labelled separately. ALB target HTTP response codes are separate from ALB-generated errors, while NLB metrics represent network connections, not HTTP requests. CloudWatch API requests and custom dashboards may incur AWS charges.
+
 ## Run
 
 After installation:

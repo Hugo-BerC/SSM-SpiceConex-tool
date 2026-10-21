@@ -120,7 +120,7 @@ def _attach_network(
     return ""
 
 
-def discover_infrastructure(profile: str, region: str, scope: str = "CURRENT REGION", tag_key: str = DEFAULT_TAG_KEY) -> InfrastructureGraph:
+def discover_infrastructure(profile: str, region: str, scope: str = "CURRENT REGION", tag_key: str = DEFAULT_TAG_KEY, selected_regions: list[str] | None = None) -> InfrastructureGraph:
     """Build a deterministic AWS infrastructure graph.
 
     The first implementation deliberately favours service APIs over heuristic
@@ -145,7 +145,11 @@ def discover_infrastructure(profile: str, region: str, scope: str = "CURRENT REG
     account_name = profile
     graph = InfrastructureGraph(account_id, account_name)
 
-    if scope.upper() == "ALL REGIONS":
+    if scope.upper() == "SELECTED REGIONS":
+        regions = list(dict.fromkeys(item.strip() for item in (selected_regions or []) if item.strip()))
+        if len(regions) < 2:
+            raise ValueError("Select at least two different regions for selected-region discovery.")
+    elif scope.upper() == "ALL REGIONS":
         ec2 = session.client("ec2", region_name=region, config=_config())
         try:
             regions = [r["RegionName"] for r in ec2.describe_regions(AllRegions=False).get("Regions", [])]
@@ -284,9 +288,11 @@ def _discover_region(session, graph, region, account_id, tag_key):
     # ELBv2
     elb = session.client("elbv2", region_name=region, config=_config())
     tg_by_arn = {}
+    load_balancer_arns = []
     try:
         for lb in _paginate(elb, "describe_load_balancers", "LoadBalancers"):
             lb_id = lb["LoadBalancerArn"]
+            load_balancer_arns.append(lb_id)
             tags = _safe_tags(lambda arn=lb_id: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []))
             _add(graph, lb_id, lb_id, "ALB" if lb.get("Type") == "application" else "NLB", lb.get("LoadBalancerName", lb_id), region, account_id, tags, VpcId=lb.get("VpcId"), Scheme=lb.get("Scheme", ""))
             if lb.get("VpcId") in vpc_by_id:
@@ -311,22 +317,31 @@ def _discover_region(session, graph, region, account_id, tag_key):
             except Exception:
                 pass
 
-        for listener in _paginate(elb, "describe_listeners", "Listeners"):
-            listener_arn = listener["ListenerArn"]
-            _add(graph, listener_arn, listener_arn, "Listener", f"{listener.get('Protocol','')}:{listener.get('Port','')}", region, account_id, {}, Protocol=listener.get("Protocol", ""), Port=listener.get("Port"))
-            lb_arn = listener.get("LoadBalancerArn")
-            if lb_arn in graph.nodes:
-                add_relation(graph, lb_arn, listener_arn, "contains")
-            for cert in listener.get("Certificates", []):
-                cert_arn = cert.get("CertificateArn")
-                if cert_arn:
-                    if cert_arn not in graph.nodes:
-                        _add(graph, cert_arn, cert_arn, "ACMCertificate", cert_arn.rsplit("/", 1)[-1], region, account_id, {})
-                    add_relation(graph, listener_arn, cert_arn, "uses")
-            for action in listener.get("DefaultActions", []):
-                tg_arn = action.get("TargetGroupArn")
-                if tg_arn in tg_by_arn:
-                    add_relation(graph, listener_arn, tg_arn, "targets")
+        # DescribeListeners does not support an account-wide paginator: AWS
+        # requires a load-balancer ARN (or explicit listener ARNs). Query each
+        # discovered load balancer so one invalid call cannot discard all ELB
+        # relationships in the region.
+        for lb_arn in load_balancer_arns:
+            try:
+                for listener in _paginate(elb, "describe_listeners", "Listeners", LoadBalancerArn=lb_arn):
+                    listener_arn = listener["ListenerArn"]
+                    _add(graph, listener_arn, listener_arn, "Listener", f"{listener.get('Protocol','')}:{listener.get('Port','')}", region, account_id, {}, Protocol=listener.get("Protocol", ""), Port=listener.get("Port"))
+                    if lb_arn in graph.nodes:
+                        add_relation(graph, lb_arn, listener_arn, "contains")
+                    for cert in listener.get("Certificates", []):
+                        cert_arn = cert.get("CertificateArn")
+                        if cert_arn:
+                            if cert_arn not in graph.nodes:
+                                _add(graph, cert_arn, cert_arn, "ACMCertificate", cert_arn.rsplit("/", 1)[-1], region, account_id, {})
+                            add_relation(graph, listener_arn, cert_arn, "uses")
+                    for action in listener.get("DefaultActions", []):
+                        tg_arn = action.get("TargetGroupArn")
+                        if tg_arn in tg_by_arn:
+                            add_relation(graph, listener_arn, tg_arn, "targets")
+            except Exception as exc:
+                if _session_unavailable_error(exc):
+                    raise
+                graph.warnings.append(f"{region}: listener discovery incomplete for {lb_arn.rsplit('/', 1)[-1]}: {exc}")
     except Exception as exc:
         graph.warnings.append(f"{region}: ELB discovery incomplete: {exc}")
 
@@ -364,6 +379,32 @@ def _discover_region(session, graph, region, account_id, tag_key):
                 node.metadata["VpcId"] = vpc_id
     except Exception as exc:
         graph.warnings.append(f"{region}: Lambda discovery incomplete: {exc}")
+
+    # API Gateway metrics use an API name for REST APIs and an API ID for the
+    # v2 HTTP/WebSocket APIs. Live discovery enriches the Config inventory so
+    # metric dimensions are reliable even when Config has partial metadata.
+    try:
+        api_gateway = session.client("apigateway", region_name=region, config=_config())
+        for api in _paginate(api_gateway, "get_rest_apis", "items"):
+            api_id = api.get("id")
+            if api_id:
+                _add(graph, api_id, f"arn:aws:apigateway:{region}::/restapis/{api_id}", "APIGateway",
+                     api.get("name", api_id), region, account_id, _tags(api.get("tags")), ApiId=api_id, Protocol="REST")
+    except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
+        graph.warnings.append(f"{region}: API Gateway REST discovery incomplete: {exc}")
+    try:
+        api_gateway_v2 = session.client("apigatewayv2", region_name=region, config=_config())
+        for api in _paginate(api_gateway_v2, "get_apis", "Items"):
+            api_id = api.get("ApiId")
+            if api_id:
+                _add(graph, api_id, f"arn:aws:apigateway:{region}::/apis/{api_id}", "APIGatewayV2",
+                     api.get("Name", api_id), region, account_id, _tags(api.get("Tags")), ApiId=api_id, Protocol=api.get("ProtocolType", ""))
+    except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
+        graph.warnings.append(f"{region}: API Gateway v2 discovery incomplete: {exc}")
 
     # Auto Scaling groups link compute capacity to its actual subnets and EC2
     # members.  They are collected before EKS node groups, which can reference

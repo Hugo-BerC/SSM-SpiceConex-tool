@@ -117,6 +117,14 @@ def _resource_id(item: dict[str, Any], configuration: dict[str, Any]) -> str:
     resource_id = str(item.get("resourceId", ""))
     arn = str(item.get("arn", ""))
     internal_type = _internal_type(config_type, configuration)
+    if internal_type in {"APIGateway", "APIGatewayV2"}:
+        # Config represents API Gateway with an API ARN while the native
+        # collectors use the API ID.  Canonicalise Config to that same ID so
+        # live discovery enriches the existing node instead of producing a
+        # second, visually identical API in inventory and DR selection.
+        match = re.search(r"/(?:restapis|apis)/([^/]+)", arn)
+        if match:
+            return match.group(1)
     if internal_type in {"ALB", "NLB", "Listener", "TargetGroup", "Lambda", "RDS", "ECSCluster", "ECS", "EKS", "DynamoDB"} and arn:
         return arn
     if internal_type == "AutoScalingGroup":
