@@ -136,10 +136,10 @@ class DRDashboardPage(QWidget):
         self.context = QLabel("Run Architecture discovery for two regions to prepare a DR dashboard."); self.context.setWordWrap(True); self.context.setObjectName("footerText"); root.addWidget(self.context)
         self.tabs = QTabWidget(); self.tabs.setObjectName("inventoryTabs")
         resource_page = QWidget(); resource_layout = QVBoxLayout(resource_page); resource_layout.setContentsMargins(4, 8, 4, 4)
-        hint = QLabel("Select resources explicitly. Shared / untagged resources are not selected by default for an application. No logs are enabled or queried."); hint.setWordWrap(True); hint.setObjectName("footerText"); resource_layout.addWidget(hint)
+        hint = QLabel("Select API Gateway resources explicitly. API Gateway is the DR source of truth for external API traffic; ALB traffic can include service-to-service calls. No logs are enabled or queried."); hint.setWordWrap(True); hint.setObjectName("footerText"); resource_layout.addWidget(hint)
         filters = QHBoxLayout(); filters.setSpacing(8)
         filter_label = QLabel("FILTER RESOURCES"); filter_label.setObjectName("microLabel"); filters.addWidget(filter_label)
-        self.resource_filter = QLineEdit(); self.resource_filter.setPlaceholderText("Name, ID, type, region or attribution"); self.resource_filter.setClearButtonEnabled(True); self.resource_filter.setMinimumWidth(300); filters.addWidget(self.resource_filter, 1)
+        self.resource_filter = QLineEdit(); self.resource_filter.setPlaceholderText("API name, ID, region or attribution"); self.resource_filter.setClearButtonEnabled(True); self.resource_filter.setMinimumWidth(300); filters.addWidget(self.resource_filter, 1)
         self.resource_type_filter = QComboBox(); self.resource_type_filter.addItem("ALL TYPES"); self.resource_type_filter.setMinimumWidth(150); filters.addWidget(self.resource_type_filter)
         self.selected_only = QCheckBox("SHOW SELECTED ONLY"); self.selected_only.setObjectName("footerText"); filters.addWidget(self.selected_only)
         self.resource_visible_count = QLabel("0 / 0 resources"); self.resource_visible_count.setObjectName("sectionCounter"); filters.addWidget(self.resource_visible_count)
@@ -249,13 +249,12 @@ class DRDashboardPage(QWidget):
                 self._filter_resource_rows()
                 return
             scoped = self.graph.scoped(self.application, self.tag_key)
-            # DR is an operational metric selector, not a second full
-            # inventory. Raw AWS Config types (AWS::*) are deliberately kept
-            # in Architecture's inventory/diagram but are not actionable here.
-            hidden = {"VPC", "Subnet", "NetworkInterface", "SecurityGroup", "RouteTable", "RouteTarget", "EBS", "ACMCertificate", "EFSMountTarget"}
+            # DR traffic evidence is intentionally limited to the public API
+            # boundary. The full inventory remains available in its own tab.
+            api_gateway_types = set(TEMPLATES)
             nodes = sorted((
                 n for n in scoped.nodes.values()
-                if n.region in regions and n.resource_type not in hidden and not n.resource_type.startswith("AWS::")
+                if n.region in regions and n.resource_type in api_gateway_types
             ), key=lambda n: (n.region, n.resource_type, n.name or n.id))
             # A current graph normally has a single canonical node per API
             # Gateway after Config/live merging.  Retain this defensive view
@@ -289,14 +288,11 @@ class DRDashboardPage(QWidget):
                 row = self.resources.rowCount(); self.resources.insertRow(row)
                 direct = bool(node.tags.get(self.tag_key, "").strip())
                 attribution = "ALL PRODUCTS" if self.application == "ALL PRODUCTS" else ("APPLICATION TAG" if direct else "SHARED / UNTAGGED")
-                supported = node.resource_type in TEMPLATES
                 check = QTableWidgetItem(); check.setData(Qt.ItemDataRole.UserRole, node.id)
                 check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
                 check.setCheckState(Qt.CheckState.Unchecked)
-                if not supported:
-                    check.setToolTip("No native metric template for this resource type in this version.")
                 self.resources.setItem(row, 0, check)
-                for col, value in enumerate((node.region, node.resource_type, node.name or node.id, attribution + (" / NO TEMPLATE" if not supported else "")), 1):
+                for col, value in enumerate((node.region, node.resource_type, node.name or node.id, attribution), 1):
                     item = QTableWidgetItem(str(value)); item.setToolTip(node.id); self.resources.setItem(row, col, item)
         self.resource_type_filter.blockSignals(True)
         self.resource_type_filter.clear(); self.resource_type_filter.addItem("ALL TYPES")
@@ -310,7 +306,7 @@ class DRDashboardPage(QWidget):
         self._filter_resource_rows()
         if self.graph:
             warning = f" | Discovery warnings: {len(self.graph.warnings)} (see Architecture status)" if self.graph.warnings else ""
-            self.context.setText(f"Account {self.graph.account_id} | {self.application} | {len(self.graph.regions)} discovered region(s) | {self.resources.rowCount()} candidate resources{warning}. Native CloudWatch metrics only.")
+            self.context.setText(f"Account {self.graph.account_id} | {self.application} | {len(self.graph.regions)} discovered region(s) | {self.resources.rowCount()} API Gateway candidate(s){warning}. API Gateway native metrics only.")
             self.context.setToolTip("\n".join(self.graph.warnings))
         else:
             self.context.setText("Run Architecture discovery for two regions to prepare a DR dashboard.")
@@ -473,9 +469,10 @@ class DRDashboardPage(QWidget):
             if not self.comparison_pairs:
                 raise ValueError("Create at least one source/DR comparison set before preparing metrics.")
             metrics, skipped = build_pair_metrics(self.comparison_pairs, regions, self.application, self.tag_key)
-            # CloudWatch retains five-minute data for 63 days; choose the
-            # period from the age of the oldest sample, not interval length.
-            period = 3600 if datetime.now(timezone.utc) - start > timedelta(days=63) else 300
+            # API Gateway emits at one-minute resolution. Keep source and DR
+            # traffic comparable at that granularity while CloudWatch retains it.
+            age = datetime.now(timezone.utc) - start
+            period = 60 if age <= timedelta(days=15) else 300 if age <= timedelta(days=63) else 3600
             body = build_dashboard(self.graph.account_id, self.application, regions, metrics, period)
         except ValueError as exc:
             QMessageBox.warning(self, "DR dashboard", str(exc)); return
@@ -526,7 +523,7 @@ class DRDashboardPage(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Export DR evidence report", f"{prefix}-Disaster_Recovery-report.html", "HTML (*.html)")
         if path:
             try:
-                report = render_html_report(self.prepared["profile"], self.prepared["account"], self.prepared["application"], self.prepared["regions"], self.prepared["start"], self.prepared["end"], self.prepared["results"])
+                report = render_html_report(self.prepared["profile"], self.prepared["account"], self.prepared["application"], self.prepared["regions"], self.prepared["start"], self.prepared["end"], self.prepared["results"], self.prepared["period"])
                 with open(path, "w", encoding="utf-8") as file: file.write(report)
             except OSError as exc: self.show_error(exc)
 
