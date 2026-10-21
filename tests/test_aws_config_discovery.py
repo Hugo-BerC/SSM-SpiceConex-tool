@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from services.discovery.aws_config import discover_config_inventory
+from services.discovery.aws_config import _resource_id, discover_config_inventory
 from services.discovery.models import InfrastructureGraph
 
 
@@ -59,6 +59,14 @@ class ConfigSession:
 
 
 class AwsConfigDiscoveryTests(unittest.TestCase):
+    def test_api_gateway_config_arn_uses_the_same_identity_as_live_discovery(self):
+        item = {
+            "resourceType": "AWS::ApiGateway::RestApi",
+            "resourceId": "config-specific-identifier",
+            "arn": "arn:aws:apigateway:eu-south-2::/restapis/abc123",
+        }
+        self.assertEqual("abc123", _resource_id(item, {}))
+
     def test_active_recorder_contributes_known_unknown_and_related_resources(self):
         graph = InfrastructureGraph("123456789012", "engineering", ["eu-west-1"])
 

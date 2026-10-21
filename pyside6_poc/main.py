@@ -40,6 +40,7 @@ from services.certificates import (
 )
 from services.discovery.engine import DEFAULT_TAG_KEY, SUPPORTED_TAG_KEYS, discover_infrastructure
 from services.discovery.models import InfrastructureGraph, ResourceNode
+from pyside6_poc.dr_dashboard import DRDashboardPage
 from utils.logging import get_logger, log_path, log_directory, reset_logging_session
 from utils.csv_safety import csv_safe_value
 from app.config import AWS_REGIONS, DEFAULT_REGION
@@ -217,8 +218,30 @@ class Sidebar(QFrame):
         layout.addSpacing(8)
 
         self.buttons = []
-        entries = ["HOME", "TERMINAL", "TUNNELING", "COMMAND", "PERFORMANCE", "CONNECTIVITY", "FLOW LOGS", "CERTIFICATES", "ARCHITECTURE"]
+        entries = ["HOME", "TERMINAL", "TUNNELING", "COMMAND", "PERFORMANCE", "CONNECTIVITY", "FLOW LOGS", "CERTIFICATES", "SRE"]
         for index, title in enumerate(entries):
+            if index == 1:
+                # Session-oriented operational actions are grouped together.
+                # Navigation indexes stay stable for all existing flows.
+                layout.addSpacing(12)
+                sysops_section = QLabel("SYSOPS"); sysops_section.setObjectName("sidebarSection")
+                layout.addWidget(sysops_section)
+                layout.addSpacing(8)
+            elif index == 5:
+                layout.addSpacing(10)
+                network_section = QLabel("NETWORK"); network_section.setObjectName("sidebarSection")
+                layout.addWidget(network_section)
+                layout.addSpacing(8)
+            elif index == 7:
+                layout.addSpacing(10)
+                security_section = QLabel("EDGE & SECURITY"); security_section.setObjectName("sidebarSection")
+                layout.addWidget(security_section)
+                layout.addSpacing(8)
+            elif index == 8:
+                layout.addSpacing(10)
+                sre_section = QLabel("SRE"); sre_section.setObjectName("sidebarSection")
+                layout.addWidget(sre_section)
+                layout.addSpacing(8)
             button = QToolButton(); button.setText(f"◇   {title}"); button.setCheckable(True); button.setAutoExclusive(True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly); button.setObjectName("navButton")
             button.setFixedHeight(36)
@@ -283,11 +306,13 @@ class AwsConnectionRail(QFrame):
         self.region = QComboBox(); self.region.setEditable(True); self.region.addItems(AWS_REGIONS)
         self.region.setCurrentText(DEFAULT_REGION)
         region.addWidget(region_label); region.addWidget(self.region); layout.addLayout(region)
-        self.configure_profiles = QToolButton(); self.configure_profiles.setText("⚙"); self.configure_profiles.setObjectName("quietButton"); self.configure_profiles.setToolTip("Configure or regenerate AWS profiles"); self.configure_profiles.setFixedSize(42,42); layout.addWidget(self.configure_profiles, 0, Qt.AlignmentFlag.AlignBottom)
-        self.refresh_profiles = QPushButton("↻  REFRESH PROFILES"); self.refresh_profiles.setObjectName("quietButton"); self.refresh_profiles.setMinimumHeight(42); self.refresh_profiles.setToolTip("Reload the local AWS profile list without contacting AWS"); layout.addWidget(self.refresh_profiles, 0, Qt.AlignmentFlag.AlignBottom)
-        self.validate = QPushButton("✓  VALIDATE"); self.validate.setObjectName("quietButton"); self.validate.setMinimumHeight(42); layout.addWidget(self.validate, 0, Qt.AlignmentFlag.AlignBottom)
-        layout.addStretch(1)
         self.connect = QPushButton("CONNECT TO AWS  →"); self.connect.setObjectName("primaryButton"); self.connect.setMinimumHeight(42); self.connect.setToolTip("Connect the selected AWS profile and load its EC2 fleet in Terminal"); layout.addWidget(self.connect, 0, Qt.AlignmentFlag.AlignBottom)
+        # Connecting is the natural next action after selecting the context.
+        # Profile maintenance stays visually secondary on the far right.
+        layout.addStretch(1)
+        self.validate = QPushButton("✓  VALIDATE"); self.validate.setObjectName("quietButton"); self.validate.setMinimumHeight(42); layout.addWidget(self.validate, 0, Qt.AlignmentFlag.AlignBottom)
+        self.refresh_profiles = QPushButton("↻  REFRESH PROFILES"); self.refresh_profiles.setObjectName("quietButton"); self.refresh_profiles.setMinimumHeight(42); self.refresh_profiles.setToolTip("Reload the local AWS profile list without contacting AWS"); layout.addWidget(self.refresh_profiles, 0, Qt.AlignmentFlag.AlignBottom)
+        self.configure_profiles = QToolButton(); self.configure_profiles.setText("⚙"); self.configure_profiles.setObjectName("quietButton"); self.configure_profiles.setToolTip("Configure or regenerate AWS profiles"); self.configure_profiles.setFixedSize(42,42); layout.addWidget(self.configure_profiles, 0, Qt.AlignmentFlag.AlignBottom)
         shadow(self, 24, 7, 55)
 
 
@@ -2934,42 +2959,91 @@ class ArchitecturePage(BasePage):
         self.demo = demo
         self.graph: InfrastructureGraph | None = None
         self.thread = None
-        root = self.page_header(
-            "INFRASTRUCTURE DISCOVERY / ARCHITECTURE",
-            "Architecture",
-            "Discover AWS resources, map deterministic relationships and scope the topology by application tags.",
+        # Discovery is intentionally a dedicated SRE workspace.  Keeping its
+        # configuration separate means the map, inventory and DR views can use
+        # the full available height once discovery has completed.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        discovery_page = QWidget()
+        discovery_layout = QVBoxLayout(discovery_page)
+        discovery_layout.setContentsMargins(18, 18, 18, 18)
+        discovery_layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        heading = QVBoxLayout(); heading.setSpacing(3)
+        eyebrow = QLabel("SRE OPERATIONS / INFRASTRUCTURE DISCOVERY")
+        eyebrow.setObjectName("eyebrow")
+        heading.addWidget(eyebrow)
+        title = QLabel("SRE")
+        title.setObjectName("pageTitle")
+        heading.addWidget(title)
+        subtitle = QLabel(
+            "Discover AWS resources once, then inspect topology, inventory and disaster-recovery evidence in dedicated views."
         )
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        heading.addWidget(subtitle)
+        header.addLayout(heading)
+        header.addStretch()
+        self.status = QLabel("â—†  READY")
+        self.status.setObjectName("statusPill")
+        header.addWidget(self.status, alignment=Qt.AlignmentFlag.AlignTop)
+        discovery_layout.addLayout(header)
 
         controls = QFrame(); controls.setObjectName("operationPanel")
-        form = QGridLayout(controls); form.setContentsMargins(18, 16, 18, 16); form.setHorizontalSpacing(12); form.setVerticalSpacing(8)
+        form = QVBoxLayout(controls); form.setContentsMargins(18, 16, 18, 16); form.setSpacing(8)
         tag_label = QLabel("SCOPE TAG KEY"); tag_label.setObjectName("microLabel")
         self.tag_key = QComboBox(); self.tag_key.setEditable(True); self.tag_key.setMinimumHeight(38)
         self.tag_key.addItems(SUPPORTED_TAG_KEYS)
         self.tag_key.setCurrentText(DEFAULT_TAG_KEY)
         self.tag_key.lineEdit().setPlaceholderText("AWS tag key")
         scope_label = QLabel("DISCOVERY SCOPE"); scope_label.setObjectName("microLabel")
-        self.scope = QComboBox(); self.scope.addItems(["CURRENT REGION", "ALL REGIONS"]); self.scope.setMinimumHeight(38)
+        self.scope = QComboBox(); self.scope.addItems(["CURRENT REGION", "SELECTED REGIONS", "ALL REGIONS"]); self.scope.setMinimumHeight(38)
+        self.region_a_label = QLabel("REGION A"); self.region_a_label.setObjectName("microLabel")
+        self.region_b_label = QLabel("REGION B"); self.region_b_label.setObjectName("microLabel")
+        self.discovery_region_a = QComboBox(); self.discovery_region_b = QComboBox()
+        for region_selector in (self.discovery_region_a, self.discovery_region_b):
+            region_selector.setEditable(True); region_selector.addItems(AWS_REGIONS); region_selector.setMinimumHeight(38)
+        current_region = self.source.commands.region.currentText().strip() or DEFAULT_REGION
+        self.discovery_region_a.setCurrentText(current_region)
+        if self.discovery_region_b.count() > 1:
+            self.discovery_region_b.setCurrentIndex(1 if self.discovery_region_a.currentText() != self.discovery_region_b.itemText(1) else 0)
         app_label = QLabel("APPLICATION / COMPONENT"); app_label.setObjectName("microLabel")
         self.application = QComboBox(); self.application.setEditable(False); self.application.addItem("ALL PRODUCTS"); self.application.setMinimumHeight(38)
         detail_label = QLabel("MAP DETAIL"); detail_label.setObjectName("microLabel")
         self.map_detail = QComboBox(); self.map_detail.addItems(["ARCHITECTURE MAP", "CONCEPT MAP", "FULL RESOURCE GRAPH"]); self.map_detail.setMinimumHeight(38)
-        self.discover = QPushButton("DISCOVER INFRASTRUCTURE  →"); self.discover.setObjectName("primaryButton"); self.discover.setMinimumHeight(38)
+        self.discover = QPushButton("DISCOVER  →"); self.discover.setObjectName("primaryButton"); self.discover.setMinimumHeight(38)
         self.refresh_view = QPushButton("REFRESH VIEW  ↻"); self.refresh_view.setObjectName("quietButton"); self.refresh_view.setMinimumHeight(38); self.refresh_view.setEnabled(False)
         self.export_csv = QPushButton("EXPORT CSV"); self.export_csv.setObjectName("quietButton"); self.export_csv.setMinimumHeight(38); self.export_csv.setEnabled(False)
         self.clear = QPushButton("CLEAR"); self.clear.setObjectName("quietButton"); self.clear.setMinimumHeight(38)
-        form.addWidget(tag_label, 0, 0); form.addWidget(self.tag_key, 1, 0)
-        form.addWidget(scope_label, 0, 1); form.addWidget(self.scope, 1, 1)
-        form.addWidget(app_label, 0, 2); form.addWidget(self.application, 1, 2)
-        form.addWidget(detail_label, 0, 3); form.addWidget(self.map_detail, 1, 3)
+        selector_grid = QGridLayout(); selector_grid.setHorizontalSpacing(12); selector_grid.setVerticalSpacing(8)
+        selector_grid.addWidget(tag_label, 0, 0); selector_grid.addWidget(self.tag_key, 1, 0)
+        selector_grid.addWidget(scope_label, 0, 1); selector_grid.addWidget(self.scope, 1, 1)
+        selector_grid.addWidget(app_label, 0, 2); selector_grid.addWidget(self.application, 1, 2)
+        selector_grid.addWidget(detail_label, 0, 3); selector_grid.addWidget(self.map_detail, 1, 3)
+        form.addLayout(selector_grid)
         buttons = QHBoxLayout(); buttons.setSpacing(6)
         buttons.addWidget(self.discover); buttons.addWidget(self.refresh_view); buttons.addWidget(self.export_csv); buttons.addWidget(self.clear)
-        form.addLayout(buttons, 1, 4)
-        root.addWidget(controls)
+        # Scope regions form a self-contained second selector group.  It can
+        # disappear entirely for the one-region and all-region modes without
+        # leaving an empty grid row behind.
+        self.region_scope_panel = QWidget()
+        region_grid = QGridLayout(self.region_scope_panel); region_grid.setContentsMargins(0, 0, 0, 0); region_grid.setHorizontalSpacing(12); region_grid.setVerticalSpacing(8)
+        region_grid.addWidget(self.region_a_label, 0, 0); region_grid.addWidget(self.region_b_label, 0, 1)
+        region_grid.addWidget(self.discovery_region_a, 1, 0); region_grid.addWidget(self.discovery_region_b, 1, 1)
+        form.addWidget(self.region_scope_panel)
+        # Actions always come after every selector: configure, then execute.
+        form.addLayout(buttons)
+        self.scope.currentTextChanged.connect(self._discovery_scope_changed)
+        self._discovery_scope_changed(self.scope.currentText())
+        discovery_layout.addWidget(controls)
 
         summary = QHBoxLayout(); summary.setSpacing(8)
         self.context = QLabel("No infrastructure discovered"); self.context.setObjectName("inventoryContext"); summary.addWidget(self.context); summary.addStretch()
         self.count = QLabel("0 RESOURCES"); self.count.setObjectName("sectionCounter"); summary.addWidget(self.count)
-        root.addLayout(summary)
+        discovery_layout.addLayout(summary)
 
         self.inventory = FilterableTable(self.RESOURCE_COLUMNS, filter_options={"Type": [], "Region": [], "Application": []})
         self.inventory.filterChanged.connect(lambda: self.inventory_count.setText(self.inventory.count_text("resources")))
@@ -3004,11 +3078,22 @@ class ArchitecturePage(BasePage):
         self.map = ArchitectureMap(); map_layout.addWidget(self.map, 1)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("inventoryTabs")
+        self.tabs.addTab(discovery_page, "DISCOVERY")
         self.tabs.addTab(map_page, "ARCHITECTURE MAP")
         self.tabs.addTab(resource_page, "RESOURCE INVENTORY")
+        self.dr_page = DRDashboardPage(
+            lambda: self.source.commands.profile.currentText(), _run_with_sso,
+            lambda exc: show_exception(self, "DR dashboard", "preparing or publishing the DR dashboard", exc), demo,
+        )
+        self.tabs.addTab(self.dr_page, "DR DASHBOARD")
+        self.source.commands.profile.currentTextChanged.connect(self.dr_page.profile_changed)
         root.addWidget(self.tabs, 1)
 
-        self.status_detail = QLabel("Discovery has not been run."); self.status_detail.setObjectName("footerText"); self.status_detail.setWordWrap(True); root.addWidget(self.status_detail)
+        self.status_detail = QLabel("Discovery has not been run.")
+        self.status_detail.setObjectName("footerText")
+        self.status_detail.setWordWrap(True)
+        discovery_layout.addWidget(self.status_detail)
+        discovery_layout.addStretch(1)
         self.discover.clicked.connect(self.run_discovery)
         self.refresh_view.clicked.connect(self.refresh_view_only)
         self.export_csv.clicked.connect(lambda: _export_filtered_table(self, self.inventory, "Export resource inventory", "resources.csv"))
@@ -3021,11 +3106,16 @@ class ArchitecturePage(BasePage):
         if demo:
             self.graph = self._demo_graph(); self._populate(self.graph)
 
+    def _discovery_scope_changed(self, scope):
+        visible = scope == "SELECTED REGIONS"
+        self.region_scope_panel.setVisible(visible)
+
     def run_discovery(self):
         profile = self.source.commands.profile.currentText().strip()
         region = self.source.commands.region.currentText().strip() or DEFAULT_REGION
         tag_key = self.tag_key.currentText().strip() or DEFAULT_TAG_KEY
         scope = self.scope.currentText()
+        selected_regions = [self.discovery_region_a.currentText().strip(), self.discovery_region_b.currentText().strip()] if scope == "SELECTED REGIONS" else None
         logger.info(
             "Architecture discovery requested | profile=%r | region=%s | scope=%s | tag=%s | demo=%s",
             profile, region, scope, tag_key, self.demo,
@@ -3033,14 +3123,18 @@ class ArchitecturePage(BasePage):
         if not profile:
             show_dialog(self, QMessageBox.Icon.Warning, "AWS profile", "No AWS profile is selected.", "Select an AWS profile in Terminal before running Architecture Discovery.")
             return
+        if selected_regions is not None and (not all(selected_regions) or selected_regions[0] == selected_regions[1]):
+            show_dialog(self, QMessageBox.Icon.Warning, "Architecture discovery", "Select two different regions before discovery.")
+            return
+        self.dr_page.preferred_regions = tuple(selected_regions or ())
         self.discover.setEnabled(False)
         self.status.setText("●  DISCOVERING INFRASTRUCTURE")
         self.status_detail.setText(f"Querying AWS · {profile} · {region} · {scope} · tag {tag_key}")
         QApplication.processEvents()
         if self.demo:
-            self._populate(self._demo_graph()); self.discover.setEnabled(True); return
+            self.graph = self._demo_graph(); self._populate(self.graph); self.discover.setEnabled(True); return
         self.thread = QThread()
-        self.worker = Worker(lambda: _run_with_sso(profile, lambda: discover_infrastructure(profile, region, scope, tag_key)))
+        self.worker = Worker(lambda: _run_with_sso(profile, lambda: discover_infrastructure(profile, region, scope, tag_key, selected_regions)))
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.finished.connect(self._discovery_finished)
@@ -3131,9 +3225,11 @@ class ArchitecturePage(BasePage):
         self.count.setText(f"{len(scoped.nodes)} / {len(graph.nodes)} RESOURCES")
         self.context.setText(f"{graph.account_name} · {graph.account_id} · {application} · {len(scoped.edges)} relationships")
         self.map.render_graph(scoped, application, tag_key, detail=self.map_detail.currentText())
+        self.dr_page.set_context(graph, application, tag_key)
 
     def clear_view(self):
         self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.inventory_count.setText("0 / 0 resources"); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("CONCEPT MAP"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.resource_export.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
+        self.dr_page.set_context(None, "ALL PRODUCTS", DEFAULT_TAG_KEY)
 
         # Keep the VPC-aware topology as the default after clearing a view.
         self.map_detail.setCurrentText("ARCHITECTURE MAP")

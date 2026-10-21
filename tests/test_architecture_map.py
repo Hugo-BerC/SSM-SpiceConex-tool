@@ -43,7 +43,7 @@ class ArchitectureMapTests(unittest.TestCase):
         page = ArchitecturePage(SimpleNamespace(commands=SimpleNamespace(profile=profile, region=region)), demo=True)
 
         tab_titles = [page.tabs.tabText(index) for index in range(page.tabs.count())]
-        self.assertEqual(["ARCHITECTURE MAP", "RESOURCE INVENTORY"], tab_titles)
+        self.assertEqual(["DISCOVERY", "ARCHITECTURE MAP", "RESOURCE INVENTORY", "DR DASHBOARD"], tab_titles)
         self.assertEqual("ARCHITECTURE MAP", page.map_detail.currentText())
         self.assertGreater(page.inventory.table.rowCount(), 0)
         self.assertTrue(page.resource_export.isEnabled())
