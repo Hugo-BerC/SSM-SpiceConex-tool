@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">SpiceConex</h1>
-<p align="center"><strong>AWS operations cockpit for SRE / Cloud Engineering</strong><br>EC2 · SSM · Tunneling · Commands · Performance · Connectivity · Certificates · Architecture</p>
+<p align="center"><strong>AWS operations cockpit for SRE / Cloud Engineering</strong><br>EC2 · SSM · Tunneling · Commands · Performance · Connectivity · Certificates · Route 53 · CloudFront · Architecture</p>
 
 ---
 
@@ -158,6 +158,8 @@ The AWS command itself remains the standard `aws ssm start-session` flow; the te
 | **Performance** | EBS / CloudWatch telemetry and baselines |
 | **Connectivity** | Connectivity CSV validation and endpoint checks |
 | **Certificates** | ACM inventory, load-balancer correlation and filtered CSV export |
+| **Route 53** | Private hosted-zone selector, DNS record discovery, per-column filters and CSV export |
+| **CloudFront** | Global distribution inventory with delivery, origin, WAF, protocol and configuration filters |
 | **Architecture** | Deterministic AWS discovery, resource inventory and architecture projection |
 
 ### Operational safeguards
@@ -220,7 +222,7 @@ app/                 Application configuration and update service
 aws/                 AWS / SSO / session helpers
 models/              Domain models
 pyside6_poc/         PySide6 application UI
-services/             SSM, certificates, discovery and performance services
+services/             SSM, certificates, Route 53, discovery and performance services
 terminal/             Cross-platform interactive terminal launcher
 utils/                Logging and local paths
 setup.sh              Unix / macOS / WSL bootstrapper
