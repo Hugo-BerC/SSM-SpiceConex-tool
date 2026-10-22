@@ -38,6 +38,11 @@ from services.flow_logs import analyse_flow_log, discover_vpc_flow_inventory
 from services.certificates import (
     BALANCER_COLUMNS, CERTIFICATE_COLUMNS, discover_certificate_inventory,
 )
+from services.route53 import (
+    ROUTE53_RECORD_COLUMNS, discover_hosted_zone_records,
+    discover_private_hosted_zones,
+)
+from services.cloudfront import CLOUDFRONT_COLUMNS, discover_distributions
 from services.discovery.engine import DEFAULT_TAG_KEY, SUPPORTED_TAG_KEYS, discover_infrastructure
 from services.discovery.models import InfrastructureGraph, ResourceNode
 from pyside6_poc.dr_dashboard import DRDashboardPage
@@ -218,7 +223,7 @@ class Sidebar(QFrame):
         layout.addSpacing(8)
 
         self.buttons = []
-        entries = ["HOME", "TERMINAL", "TUNNELING", "COMMAND", "PERFORMANCE", "CONNECTIVITY", "FLOW LOGS", "CERTIFICATES", "SRE"]
+        entries = ["HOME", "TERMINAL", "TUNNELING", "COMMAND", "PERFORMANCE", "CONNECTIVITY", "FLOW LOGS", "CERTIFICATES", "ROUTE 53", "CLOUDFRONT", "SRE"]
         for index, title in enumerate(entries):
             if index == 1:
                 # Session-oriented operational actions are grouped together.
@@ -237,7 +242,7 @@ class Sidebar(QFrame):
                 security_section = QLabel("EDGE & SECURITY"); security_section.setObjectName("sidebarSection")
                 layout.addWidget(security_section)
                 layout.addSpacing(8)
-            elif index == 8:
+            elif index == 10:
                 layout.addSpacing(10)
                 sre_section = QLabel("SRE"); sre_section.setObjectName("sidebarSection")
                 layout.addWidget(sre_section)
@@ -1370,6 +1375,270 @@ class CertificatesPage(BasePage):
             self.thread.deleteLater()
             self.thread = None
         self.worker = None
+
+
+class Route53Page(BasePage):
+    """Private Route 53 hosted-zone and record-set explorer."""
+
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+        self.thread = None
+        self.worker = None
+        self.job = ""
+        self.zones_by_id = {}
+        self.selected_zone = None
+
+        root = self.page_header(
+            "EDGE & SECURITY / PRIVATE DNS",
+            "Route 53",
+            "Discover private hosted zones and inspect their DNS records in the selected AWS account.",
+        )
+        panel = QFrame(); panel.setObjectName("operationPanel")
+        form = QHBoxLayout(panel); form.setContentsMargins(20, 16, 20, 16); form.setSpacing(12)
+
+        context = QVBoxLayout(); context.setSpacing(2)
+        label = QLabel("AWS CONTEXT"); label.setObjectName("microLabel")
+        self.context = QLabel("Select an account in Terminal"); self.context.setObjectName("inventoryContext")
+        context.addWidget(label); context.addWidget(self.context); form.addLayout(context, 1)
+
+        zone_box = QVBoxLayout(); zone_box.setSpacing(5)
+        zone_label = QLabel("PRIVATE HOSTED ZONE"); zone_label.setObjectName("microLabel")
+        zone_box.addWidget(zone_label)
+        self.zone_selector = QComboBox(); self.zone_selector.setObjectName("route53ZoneSelector")
+        self.zone_selector.setMinimumWidth(410); self.zone_selector.setEditable(True)
+        self.zone_selector.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.zone_selector.lineEdit().setPlaceholderText("Search a private hosted zone…")
+        self.zone_selector.setCompleter(QCompleter(self.zone_selector.model(), self.zone_selector))
+        completer = self.zone_selector.completer()
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        zone_box.addWidget(self.zone_selector); form.addLayout(zone_box, 3)
+
+        self.refresh_zones = QPushButton("REFRESH PHZS  ↻"); self.refresh_zones.setObjectName("quietButton"); self.refresh_zones.setMinimumHeight(42)
+        self.discover_records = QPushButton("DISCOVER RECORDS  →"); self.discover_records.setObjectName("primaryButton"); self.discover_records.setMinimumHeight(42); self.discover_records.setEnabled(False)
+        form.addWidget(self.refresh_zones); form.addWidget(self.discover_records); root.addWidget(panel)
+
+        toolbar = QHBoxLayout()
+        self.summary = QLabel("No private hosted zones loaded."); self.summary.setObjectName("tunnelInfo"); toolbar.addWidget(self.summary); toolbar.addStretch()
+        clear = QPushButton("CLEAR FILTERS"); clear.setObjectName("quietButton"); clear.clicked.connect(self._clear_filters); toolbar.addWidget(clear); root.addLayout(toolbar)
+
+        records_header = QHBoxLayout()
+        records_title = QLabel("PRIVATE DNS RECORDS"); records_title.setObjectName("sectionTitle"); records_header.addWidget(records_title); records_header.addStretch()
+        self.record_count = QLabel("0 / 0 records"); self.record_count.setObjectName("sectionCounter"); records_header.addWidget(self.record_count)
+        self.records_export = QPushButton("EXPORT CSV"); self.records_export.setObjectName("quietButton"); self.records_export.setEnabled(False)
+        self.records_export.clicked.connect(lambda: _export_filtered_table(self, self.records_table, "Export Route 53 records", "route53-records.csv"))
+        records_header.addWidget(self.records_export); root.addLayout(records_header)
+
+        self.records_table = FilterableTable(ROUTE53_RECORD_COLUMNS, "route53RecordsTable")
+        self.records_table.filterChanged.connect(lambda: self.record_count.setText(self.records_table.count_text("records")))
+        root.addWidget(self.records_table, 1)
+
+        self.refresh_zones.clicked.connect(self.run_zone_discovery)
+        self.discover_records.clicked.connect(self.run_record_discovery)
+        self.zone_selector.currentIndexChanged.connect(self._zone_changed)
+        self.source.commands.profile.currentTextChanged.connect(lambda _value: self._update_context())
+        self.source.commands.region.currentTextChanged.connect(lambda _value: self._update_context())
+        self._update_context()
+
+    def _update_context(self):
+        profile = self.source.commands.profile.currentText().strip()
+        region = self.source.commands.region.currentText().strip() or DEFAULT_REGION
+        self.context.setText(f"{profile}  ·  {region}" if profile else "Select an account in Terminal")
+
+    def _aws_context(self):
+        profile = self.source.commands.profile.currentText().strip()
+        region = self.source.commands.region.currentText().strip()
+        if not profile:
+            show_dialog(self, QMessageBox.Icon.Warning, "No AWS account selected", "No AWS profile is selected in Terminal.", "Go to Terminal, select the account/profile and retry the Route 53 discovery.")
+            return None
+        if not region:
+            show_dialog(self, QMessageBox.Icon.Warning, "No AWS region selected", "No region is configured in Terminal.", "Select an AWS region in Terminal and retry the Route 53 discovery.")
+            return None
+        return profile, region
+
+    def _selected_zone(self):
+        zone_id = self.zone_selector.currentData()
+        if zone_id in self.zones_by_id:
+            return self.zones_by_id[zone_id]
+        text = self.zone_selector.currentText().strip()
+        for index in range(self.zone_selector.count()):
+            if self.zone_selector.itemText(index).casefold() == text.casefold():
+                return self.zones_by_id.get(self.zone_selector.itemData(index))
+        return None
+
+    def _zone_changed(self, _index):
+        zone = self._selected_zone()
+        self.discover_records.setEnabled(zone is not None and self.thread is None)
+        if zone is None or zone == self.selected_zone:
+            return
+        self.selected_zone = zone
+        self.records_table.set_rows([]); self.records_export.setEnabled(False); self.record_count.setText("0 / 0 records")
+        self.summary.setText(f"{len(self.zones_by_id)} private hosted zones discovered · Selected: {zone['Name']}")
+
+    def _start_worker(self, job, operation):
+        self.job = job; self.refresh_zones.setEnabled(False); self.discover_records.setEnabled(False)
+        self.thread = QThread(); self.worker = Worker(operation); self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run); self.worker.finished.connect(self.finished); self.worker.failed.connect(self.failed)
+        self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+
+    def run_zone_discovery(self):
+        context = self._aws_context()
+        if not context:
+            return
+        profile, region = context; self._update_context(); self.summary.setText(f"Discovering private hosted zones for {profile}…"); self.status.setText("●  QUERYING AWS")
+        self._start_worker("zones", lambda: _run_with_sso(profile, lambda: discover_private_hosted_zones(profile, region)))
+
+    def run_record_discovery(self):
+        context = self._aws_context(); zone = self._selected_zone()
+        if not context or not zone:
+            if context and not zone:
+                show_dialog(self, QMessageBox.Icon.Warning, "No private hosted zone selected", "Select a private hosted zone before discovering records.")
+            return
+        profile, region = context; self.selected_zone = zone; self.summary.setText(f"Discovering DNS records for {zone['Name']}…"); self.status.setText("●  QUERYING AWS")
+        self._start_worker("records", lambda: _run_with_sso(profile, lambda: discover_hosted_zone_records(profile, region, zone["Id"])))
+
+    @Slot(object)
+    def finished(self, result):
+        if self.job == "zones":
+            zones = result.get("zones", []); self.zones_by_id = {zone["Id"]: zone for zone in zones}; self.selected_zone = None
+            self.zone_selector.blockSignals(True); self.zone_selector.clear()
+            for zone in zones:
+                suffix = f"{zone['RecordSetCount']} records"
+                if zone.get("Comment"):
+                    suffix += f" · {zone['Comment']}"
+                self.zone_selector.addItem(f"{zone['Name']}  ·  {suffix}  ·  {zone['Id']}", zone["Id"])
+            self.zone_selector.setCurrentIndex(0 if zones else -1); self.zone_selector.blockSignals(False)
+            self.records_table.set_rows([]); self.records_export.setEnabled(False); self.record_count.setText("0 / 0 records")
+            if zones:
+                self.selected_zone = zones[0]; self.discover_records.setEnabled(True)
+                self.summary.setText(f"{len(zones)} private hosted zones discovered · Select one and discover its DNS records."); self.status.setText("●  PHZ INVENTORY READY")
+            else:
+                self.summary.setText("No private hosted zones are visible to the selected AWS profile."); self.status.setText("●  NO PRIVATE HOSTED ZONES")
+        else:
+            records = result.get("records", []); self.records_table.set_rows(records); self.records_export.setEnabled(bool(records)); self.record_count.setText(self.records_table.count_text("records"))
+            zone = self.selected_zone or {"Name": result.get("hosted_zone_id", "selected zone")}
+            self.summary.setText(f"{zone['Name']} · {len(records)} DNS records discovered."); self.status.setText("●  RECORDS READY")
+        logger.info("Route 53 UI updated | job=%s", self.job)
+
+    @Slot(object)
+    def failed(self, exc):
+        if not isinstance(exc, Exception):
+            exc = RuntimeError(str(exc))
+        self.status.setText("◇  AWS ERROR")
+        action = "discovering private hosted zones" if self.job == "zones" else "discovering private DNS records"
+        self.summary.setText("Route 53 discovery failed.")
+        logger.error("Route 53 discovery failed | job=%s | %s: %s", self.job, type(exc).__name__, exc)
+        show_exception(self, "Route 53 discovery failed", action, exc)
+
+    def _clear_filters(self):
+        self.records_table.clear_filters()
+
+    def cleanup(self):
+        logger.info("Route 53 worker thread finished | job=%s", self.job)
+        if self.thread:
+            self.thread.deleteLater(); self.thread = None
+        self.worker = None; self.refresh_zones.setEnabled(True); self.discover_records.setEnabled(self._selected_zone() is not None)
+
+
+class CloudFrontPage(BasePage):
+    """Account-scoped CloudFront distribution inventory."""
+
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+        self.thread = None
+        self.worker = None
+        self.distributions = []
+
+        root = self.page_header(
+            "EDGE & SECURITY / CONTENT DELIVERY",
+            "CloudFront",
+            "Discover CloudFront distributions and inspect their delivery, origin and protection configuration.",
+        )
+        panel = QFrame(); panel.setObjectName("operationPanel")
+        form = QHBoxLayout(panel); form.setContentsMargins(20, 16, 20, 16); form.setSpacing(12)
+        context = QVBoxLayout(); context.setSpacing(2)
+        label = QLabel("AWS CONTEXT"); label.setObjectName("microLabel")
+        self.context = QLabel("Select an account in Terminal"); self.context.setObjectName("inventoryContext")
+        context.addWidget(label); context.addWidget(self.context); form.addLayout(context, 1)
+        detail = QLabel("Global service · all distributions visible to the selected profile")
+        detail.setObjectName("tunnelInfo"); detail.setWordWrap(True); form.addWidget(detail, 2)
+        self.discover = QPushButton("DISCOVER DISTRIBUTIONS  →")
+        self.discover.setObjectName("primaryButton"); self.discover.setMinimumHeight(42); form.addWidget(self.discover)
+        root.addWidget(panel)
+
+        toolbar = QHBoxLayout()
+        self.summary = QLabel("No CloudFront inventory loaded."); self.summary.setObjectName("tunnelInfo"); toolbar.addWidget(self.summary); toolbar.addStretch()
+        clear = QPushButton("CLEAR FILTERS"); clear.setObjectName("quietButton"); clear.clicked.connect(self._clear_filters); toolbar.addWidget(clear)
+        root.addLayout(toolbar)
+
+        table_header = QHBoxLayout()
+        title = QLabel("CLOUDFRONT DISTRIBUTIONS"); title.setObjectName("sectionTitle"); table_header.addWidget(title); table_header.addStretch()
+        self.count = QLabel("0 / 0 distributions"); self.count.setObjectName("sectionCounter"); table_header.addWidget(self.count)
+        self.export = QPushButton("EXPORT CSV"); self.export.setObjectName("quietButton"); self.export.setEnabled(False)
+        self.export.clicked.connect(lambda: _export_filtered_table(self, self.table, "Export CloudFront distributions", "cloudfront-distributions.csv"))
+        table_header.addWidget(self.export); root.addLayout(table_header)
+
+        self.table = FilterableTable(CLOUDFRONT_COLUMNS, "cloudfrontDistributionTable", {
+            "Status": ["Deployed", "InProgress"],
+            "Enabled": ["YES", "NO"],
+            "WAF": ["Enabled", "None"],
+            "IPv6": ["YES", "NO"],
+        })
+        self.table.filterChanged.connect(lambda: self.count.setText(self.table.count_text("distributions")))
+        root.addWidget(self.table, 1)
+
+        self.discover.clicked.connect(self.run_discovery)
+        self.source.commands.profile.currentTextChanged.connect(lambda _value: self._update_context())
+        self.source.commands.region.currentTextChanged.connect(lambda _value: self._update_context())
+        self._update_context()
+
+    def _update_context(self):
+        profile = self.source.commands.profile.currentText().strip()
+        region = self.source.commands.region.currentText().strip() or DEFAULT_REGION
+        self.context.setText(f"{profile}  ·  {region}" if profile else "Select an account in Terminal")
+
+    def run_discovery(self):
+        profile = self.source.commands.profile.currentText().strip()
+        region = self.source.commands.region.currentText().strip()
+        if not profile:
+            show_dialog(self, QMessageBox.Icon.Warning, "No AWS account selected", "No AWS profile is selected in Terminal.", "Go to Terminal, select the account/profile and retry the CloudFront discovery.")
+            return
+        if not region:
+            show_dialog(self, QMessageBox.Icon.Warning, "No AWS region selected", "No region is configured in Terminal.", "Select an AWS region in Terminal and retry the CloudFront discovery.")
+            return
+        self._update_context(); self.discover.setEnabled(False); self.summary.setText(f"Discovering CloudFront distributions for {profile}…"); self.status.setText("●  QUERYING AWS")
+        self.thread = QThread(); self.worker = Worker(lambda: _run_with_sso(profile, lambda: discover_distributions(profile, region)))
+        self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self.finished); self.worker.failed.connect(self.failed)
+        self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+
+    @Slot(object)
+    def finished(self, result):
+        self.distributions = result.get("distributions", [])
+        self.table.set_rows(self.distributions); self.export.setEnabled(bool(self.distributions)); self.count.setText(self.table.count_text("distributions"))
+        profile = result.get("profile", "selected profile")
+        self.summary.setText(f"{len(self.distributions)} CloudFront distributions discovered for {profile}.")
+        self.status.setText("●  INVENTORY READY")
+        logger.info("CloudFront UI updated | distributions=%d", len(self.distributions))
+
+    @Slot(object)
+    def failed(self, exc):
+        if not isinstance(exc, Exception):
+            exc = RuntimeError(str(exc))
+        self.status.setText("◇  AWS ERROR"); self.summary.setText("CloudFront discovery failed.")
+        logger.error("CloudFront discovery failed | %s: %s", type(exc).__name__, exc)
+        show_exception(self, "CloudFront discovery failed", "discovering CloudFront distributions", exc)
+
+    def _clear_filters(self):
+        self.table.clear_filters()
+
+    def cleanup(self):
+        logger.info("CloudFront worker thread finished")
+        if self.thread:
+            self.thread.deleteLater(); self.thread = None
+        self.worker = None; self.discover.setEnabled(True)
 
 
 class ConnectivityMap(QGraphicsView):
@@ -3304,8 +3573,8 @@ class MainWindow(QMainWindow):
         super().__init__(); logger.info("Application window created | demo=%s", demo); self.setWindowTitle("SpiceConex · Arrakis Operations"); self.resize(1400,860); self.setMinimumSize(1120,720)
         container=QWidget(); layout=QHBoxLayout(container); layout.setContentsMargins(0,0,0,0); layout.setSpacing(0); self.setCentralWidget(container)
         self.sidebar=Sidebar(); layout.addWidget(self.sidebar); self.stack=QStackedWidget(); layout.addWidget(self.stack,1)
-        self.home=HomePage(self.sidebar,demo); self.power=PowerCon(self.sidebar,self.home.commands,self.home,demo); self.home.set_terminal(self.power); self.tunnel=Tunneling(self.power); self.command=CommandPage(self.power); self.performance=PerformancePage(self.power); self.connectivity=ConnectivityPage(self.power); self.flow_logs=FlowLogsPage(self.power); self.certificates=CertificatesPage(self.power); self.architecture=ArchitecturePage(self.power,demo)
-        for page in (self.home,self.power,self.tunnel,self.command,self.performance,self.connectivity,self.flow_logs,self.certificates,self.architecture): self.stack.addWidget(page)
+        self.home=HomePage(self.sidebar,demo); self.power=PowerCon(self.sidebar,self.home.commands,self.home,demo); self.home.set_terminal(self.power); self.tunnel=Tunneling(self.power); self.command=CommandPage(self.power); self.performance=PerformancePage(self.power); self.connectivity=ConnectivityPage(self.power); self.flow_logs=FlowLogsPage(self.power); self.certificates=CertificatesPage(self.power); self.route53=Route53Page(self.power); self.cloudfront=CloudFrontPage(self.power); self.architecture=ArchitecturePage(self.power,demo)
+        for page in (self.home,self.power,self.tunnel,self.command,self.performance,self.connectivity,self.flow_logs,self.certificates,self.route53,self.cloudfront,self.architecture): self.stack.addWidget(page)
         self.sidebar.pageRequested.connect(self.stack.setCurrentIndex)
         self.stack.currentChanged.connect(self.sidebar.set_current_page)
         self.home.connected.connect(self.show_terminal)
