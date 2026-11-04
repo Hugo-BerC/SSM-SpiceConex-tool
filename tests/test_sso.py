@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
-from aws.sso import _complete_device_url
+from aws.sso import _complete_device_url, login_profile
 
 
 class SsoOutputParsingTests(unittest.TestCase):
@@ -37,6 +38,21 @@ class SsoOutputParsingTests(unittest.TestCase):
             "https://example.awsapps.com/start/#/device?user_code=WXYZ-1234",
             _complete_device_url(lines),
         )
+
+    @patch("aws.sso.sys.platform", "win32")
+    @patch("aws.sso.shutil.which", return_value="aws.exe")
+    @patch("aws.sso.subprocess.Popen")
+    def test_windows_delegates_browser_launch_to_aws_cli(self, popen, _which):
+        process = MagicMock()
+        process.communicate.return_value = ("Successfully logged in", None)
+        process.returncode = 0
+        popen.return_value = process
+
+        self.assertIsNone(login_profile("engineering"))
+
+        args = popen.call_args.args[0]
+        self.assertEqual(["aws.exe", "sso", "login", "--profile", "engineering"], args)
+        self.assertNotIn("--no-browser", args)
 
 
 if __name__ == "__main__":
