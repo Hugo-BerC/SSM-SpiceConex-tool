@@ -21,25 +21,50 @@ def _clean_url(value: str) -> str:
 
 
 def _complete_device_url(lines: list[str]) -> str | None:
-    """Prefer AWS CLI's complete URL; otherwise append its device code to the device URL."""
-    urls: list[str] = []
+    """Return the code-bearing authorization URL emitted by AWS CLI.
+
+    AWS CLI 2.33 introduced ``signin.aws/platform/authorize`` output where the
+    code and the alternative autofill URL are printed on separate lines.  Keep
+    support for the older ``#/device`` flow while deliberately waiting for the
+    autofill URL in the newer flow instead of opening its first, code-less URL.
+    """
+    device_urls: list[str] = []
+    autofill_urls: list[str] = []
     code: str | None = None
+    expect_code = False
+    expect_autofill_url = False
     for line in lines:
+        lower = line.lower()
+        if "then enter the code" in lower or "code to continue" in lower:
+            expect_code = True
+        if "alternatively" in lower or "autofill the code" in lower:
+            expect_autofill_url = True
         for match in _URL_RE.findall(line):
             url = _clean_url(match)
             if "user_code=" in url.lower():
                 return url
+            if expect_autofill_url:
+                autofill_urls.append(url)
+                expect_autofill_url = False
+                continue
             if "/device" in url.lower():
-                urls.append(url)
-        if "user code" in line.lower() or "code:" in line.lower() or "code to continue" in line.lower():
+                device_urls.append(url)
+        if expect_code:
+            match = _CODE_RE.fullmatch(line.strip())
+            if match:
+                code = match.group(1).upper()
+                expect_code = False
+        if "user code" in lower or "code:" in lower or "code to continue" in lower:
             match = _CODE_RE.search(line)
             if match:
                 code = match.group(1).upper()
-    if urls and code:
+    if autofill_urls:
+        return autofill_urls[-1]
+    if device_urls and code:
         # AWS IAM Identity Center expects user_code in the URL fragment route,
         # e.g. https://d-xxxx.awsapps.com/start/#/device?user_code=ABCD-EFGH.
-        return f"{urls[0]}?user_code={quote(code)}"
-    return urls[0] if urls else None
+        return f"{device_urls[0]}?user_code={quote(code)}"
+    return device_urls[0] if device_urls else None
 
 
 def login_profile(profile: str) -> str | None:

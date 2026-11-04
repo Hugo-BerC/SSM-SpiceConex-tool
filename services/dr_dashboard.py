@@ -86,9 +86,21 @@ def format_metric_value(value: float) -> str:
     return f"{number:.6f}".rstrip("0").rstrip(".")
 
 
-# The DR evidence dashboard deliberately uses the public API boundary as its
-# source of truth. An ALB can also carry east-west traffic between services,
-# therefore its counters cannot be presented as API traffic during a failover.
+def report_metric_key(metric: Metric) -> str:
+    """Stable key for an operator-selectable metric in the DR HTML report."""
+    return "\x1f".join((
+        metric.resource_type,
+        metric.name,
+        metric.label,
+        metric.statistic,
+        metric.unit,
+    ))
+
+
+# Curated architectural resources with an actionable CloudWatch metric
+# dimension. Structural inventory (VPCs, subnets, ENIs, security groups, etc.)
+# deliberately stays out of the DR selector even though it remains available
+# in Resource Inventory and Architecture Map.
 TEMPLATES = {
     "APIGateway": ("AWS/ApiGateway", "ApiName", [
         ("Count", "SampleCount", "API calls", "Count"),
@@ -103,6 +115,101 @@ TEMPLATES = {
         ("5xx", "Sum", "HTTP 5xx errors", "Count"),
     ]),
     "ECS": ("AWS/ECS", "", []),
+    "EC2": ("AWS/EC2", "InstanceId", [
+        ("CPUUtilization", "Average", "CPU utilization", "Percent"),
+        ("NetworkIn", "Sum", "Network received", "Bytes"),
+        ("NetworkOut", "Sum", "Network sent", "Bytes"),
+        ("StatusCheckFailed", "Maximum", "Failed status checks", "Count"),
+    ]),
+    "EBS": ("AWS/EBS", "VolumeId", [
+        ("VolumeReadBytes", "Sum", "Read throughput", "Bytes"),
+        ("VolumeWriteBytes", "Sum", "Write throughput", "Bytes"),
+        ("VolumeQueueLength", "Average", "Queue length", "Count"),
+        ("BurstBalance", "Average", "Burst balance", "Percent"),
+    ]),
+    "ALB": ("AWS/ApplicationELB", "LoadBalancer", [
+        ("RequestCount", "Sum", "Requests processed", "Count"),
+        ("TargetResponseTime", "p99", "Target response time / p99", "Seconds"),
+        ("HTTPCode_ELB_5XX_Count", "Sum", "Load balancer HTTP 5xx", "Count"),
+        ("ActiveConnectionCount", "Sum", "Active connections", "Count"),
+    ]),
+    "ALBTargetGroup": ("AWS/ApplicationELB", "TargetGroup", [
+        ("RequestCountPerTarget", "Sum", "Requests per target", "Count"),
+        ("HTTPCode_Target_2XX_Count", "Sum", "Target HTTP 2xx", "Count"),
+        ("HTTPCode_Target_4XX_Count", "Sum", "Target HTTP 4xx", "Count"),
+        ("HTTPCode_Target_5XX_Count", "Sum", "Target HTTP 5xx", "Count"),
+        ("TargetResponseTime", "p99", "Target response time / p99", "Seconds"),
+    ]),
+    "NLB": ("AWS/NetworkELB", "LoadBalancer", [
+        ("ActiveFlowCount", "Average", "Active flows", "Count"),
+        ("NewFlowCount", "Sum", "New flows", "Count"),
+        ("ProcessedBytes", "Sum", "Processed bytes", "Bytes"),
+        ("TCP_ELB_Reset_Count", "Sum", "Load balancer TCP resets", "Count"),
+    ]),
+    "NLBTargetGroup": ("AWS/NetworkELB", "TargetGroup", [
+        ("ActiveFlowCount", "Average", "Active target flows", "Count"),
+        ("NewFlowCount", "Sum", "New target flows", "Count"),
+        ("HealthyHostCount", "Minimum", "Healthy targets", "Count"),
+        ("UnHealthyHostCount", "Maximum", "Unhealthy targets", "Count"),
+    ]),
+    "GWLB": ("AWS/GatewayELB", "LoadBalancer", [
+        ("ActiveFlowCount", "Average", "Active flows", "Count"),
+        ("NewFlowCount", "Sum", "New flows", "Count"),
+        ("ProcessedBytes", "Sum", "Processed bytes", "Bytes"),
+        ("RejectedFlowCount", "Maximum", "Rejected flows", "Count"),
+    ]),
+    "GWLBTargetGroup": ("AWS/GatewayELB", "TargetGroup", [
+        ("ActiveFlowCount", "Average", "Active target flows", "Count"),
+        ("NewFlowCount", "Sum", "New target flows", "Count"),
+        ("HealthyHostCount", "Minimum", "Healthy targets", "Count"),
+        ("UnHealthyHostCount", "Maximum", "Unhealthy targets", "Count"),
+    ]),
+    "RDS": ("AWS/RDS", "DBInstanceIdentifier", [
+        ("CPUUtilization", "Average", "CPU utilization", "Percent"),
+        ("DatabaseConnections", "Average", "Database connections", "Count"),
+        ("FreeStorageSpace", "Average", "Free storage", "Bytes"),
+        ("ReadLatency", "Average", "Read latency", "Seconds"),
+        ("WriteLatency", "Average", "Write latency", "Seconds"),
+    ]),
+    "Lambda": ("AWS/Lambda", "FunctionName", [
+        ("Invocations", "Sum", "Invocations", "Count"),
+        ("Errors", "Sum", "Errors", "Count"),
+        ("Throttles", "Sum", "Throttles", "Count"),
+        ("Duration", "p99", "Duration / p99", "Milliseconds"),
+    ]),
+    "DynamoDB": ("AWS/DynamoDB", "TableName", [
+        ("ConsumedReadCapacityUnits", "Sum", "Consumed read capacity", "Count"),
+        ("ConsumedWriteCapacityUnits", "Sum", "Consumed write capacity", "Count"),
+        ("ThrottledRequests", "Sum", "Throttled requests", "Count"),
+        ("SystemErrors", "Sum", "System errors", "Count"),
+    ]),
+    "EFS": ("AWS/EFS", "FileSystemId", [
+        ("TotalIOBytes", "Sum", "Total I/O", "Bytes"),
+        ("ClientConnections", "Sum", "Client connections", "Count"),
+        ("PercentIOLimit", "Average", "I/O limit used", "Percent"),
+        ("BurstCreditBalance", "Average", "Burst credit balance", "Bytes"),
+    ]),
+    "FSx": ("AWS/FSx", "FileSystemId", [
+        ("DataReadBytes", "Sum", "Data read", "Bytes"),
+        ("DataWriteBytes", "Sum", "Data written", "Bytes"),
+    ]),
+    "ElastiCache": ("AWS/ElastiCache", "CacheClusterId", [
+        ("CPUUtilization", "Average", "CPU utilization", "Percent"),
+        ("CurrConnections", "Average", "Current connections", "Count"),
+        ("NetworkBytesIn", "Sum", "Network received", "Bytes"),
+        ("NetworkBytesOut", "Sum", "Network sent", "Bytes"),
+    ]),
+    "AutoScalingGroup": ("AWS/AutoScaling", "AutoScalingGroupName", [
+        ("GroupDesiredCapacity", "Average", "Desired capacity", "Count"),
+        ("GroupInServiceInstances", "Average", "In-service instances", "Count"),
+        ("GroupPendingInstances", "Average", "Pending instances", "Count"),
+    ]),
+    "EKS": ("ContainerInsights", "ClusterName", [
+        ("cluster_node_count", "Average", "Cluster nodes", "Count"),
+        ("cluster_failed_node_count", "Maximum", "Failed cluster nodes", "Count"),
+        ("node_cpu_utilization", "Average", "Node CPU utilization", "Percent"),
+        ("node_memory_utilization", "Average", "Node memory utilization", "Percent"),
+    ]),
 }
 
 
@@ -110,6 +217,20 @@ def _dimension_value(node: ResourceNode) -> str:
     if node.resource_type == "APIGateway":
         return node.name or ""
     if node.resource_type == "APIGatewayV2":
+        return node.id or ""
+    if node.resource_type in {"ALB", "NLB", "GWLB"}:
+        marker = "loadbalancer/"
+        return node.id.split(marker, 1)[1] if marker in node.id else ""
+    if node.resource_type in {"ALBTargetGroup", "NLBTargetGroup", "GWLBTargetGroup"}:
+        marker = "targetgroup/"
+        # CloudWatch keeps the ``targetgroup/`` prefix in this dimension,
+        # unlike the LoadBalancer dimension, which starts at ``app/`` or
+        # ``net/``.  Stripping it produces syntactically valid widgets with no
+        # matching time series.
+        return marker + node.id.split(marker, 1)[1] if marker in node.id else ""
+    if node.resource_type in {"RDS", "Lambda", "DynamoDB", "ElastiCache", "AutoScalingGroup", "EKS"}:
+        return node.name or ""
+    if node.resource_type in {"EC2", "EBS", "EFS", "FSx"}:
         return node.id or ""
     return ""
 
@@ -120,7 +241,28 @@ def _dimensions(node: ResourceNode, dimension_name: str, dimension_value: str) -
         cluster_name = cluster_arn.rsplit("/", 1)[-1]
         service_name = node.name or ""
         return (("ClusterName", cluster_name), ("ServiceName", service_name)) if cluster_name and service_name else ()
+    if node.resource_type in {"ALBTargetGroup", "NLBTargetGroup", "GWLBTargetGroup"}:
+        load_balancers = tuple(node.metadata.get("LoadBalancerArns", ()))
+        if len(load_balancers) != 1:
+            return ()
+        marker = "loadbalancer/"
+        load_balancer = str(load_balancers[0])
+        load_balancer = load_balancer.split(marker, 1)[1] if marker in load_balancer else ""
+        return (("LoadBalancer", load_balancer), ("TargetGroup", dimension_value)) if load_balancer and dimension_value else ()
     return ((dimension_name, dimension_value),) if dimension_name and dimension_value else ()
+
+
+def resource_metric_dimensions(node: ResourceNode) -> tuple[tuple[str, str], ...]:
+    """Return the exact CloudWatch dimensions that make a node selectable."""
+    template = TEMPLATES.get(node.resource_type)
+    if not template:
+        return ()
+    _namespace, dimension_name, _metrics = template
+    return _dimensions(node, dimension_name, _dimension_value(node))
+
+
+def supports_metric_resource(node: ResourceNode) -> bool:
+    return bool(resource_metric_dimensions(node))
 
 
 def _node_metrics(node: ResourceNode, application: str, tag_key: str, comparison: str = "") -> tuple[list[Metric], str | None]:
@@ -128,7 +270,7 @@ def _node_metrics(node: ResourceNode, application: str, tag_key: str, comparison
         return [], f"{node.region} / {node.resource_type} / {node.name or node.id}: no metric template"
     namespace, dimension_name, templates = TEMPLATES[node.resource_type]
     dimension_value = _dimension_value(node)
-    dimensions = _dimensions(node, dimension_name, dimension_value)
+    dimensions = resource_metric_dimensions(node)
     if not dimensions:
         return [], f"{node.region} / {node.resource_type} / {node.name or node.id}: metric dimensions unavailable"
     attribution = ("ACCOUNT SCOPE" if application == "ALL PRODUCTS" else
@@ -282,7 +424,8 @@ def build_dashboard(account: str, application: str, regions: tuple[str, str], me
     widgets = [{"type": "text", "x": 0, "y": 0, "width": 24, "height": 3, "properties": {"markdown":
         f"# Disaster recovery | {application}\nAccount: {account} | Source: {regions[0]} | DR: {regions[1]}\n"
         "Existing native metrics only. Missing data is not zero. "
-        "Each full-width widget is one metric and compares the selected source/DR resource set."}}]
+        "Each widget is one metric and compares the selected source/DR resource set. "
+        "The dashboard opens on the latest six hours; exported evidence keeps the interval selected in SpiceConex."}}]
     y = 3
     if any(metric.comparison for metric in metrics):
         # Preserve the explicit set selected in the UI. A widget has one
@@ -299,6 +442,7 @@ def build_dashboard(account: str, application: str, regions: tuple[str, str], me
             per_metric: dict[tuple[str, str, str, str], list[Metric]] = defaultdict(list)
             for metric in comparison_metrics:
                 per_metric[(metric.name, metric.label, metric.statistic, metric.unit)].append(metric)
+            metric_column = 0
             for (_name, label, stat, unit), pair_series in per_metric.items():
                 by_region: dict[str, list[Metric]] = defaultdict(list)
                 for metric in pair_series:
@@ -320,6 +464,9 @@ def build_dashboard(account: str, application: str, regions: tuple[str, str], me
                     # percentages and latency use an explicitly unweighted
                     # average across the selected resources.
                     function = "SUM" if stat in {"Sum", "SampleCount"} or _name == "RunningTaskCount" else "AVG"
+                    show_individual_container_series = resource_type == "ECS" and function == "AVG"
+                    show_individual_target_groups = resource_type in {"ALBTargetGroup", "NLBTargetGroup", "GWLBTargetGroup"}
+                    show_individual_series = show_individual_container_series or show_individual_target_groups
                     for prefix, region in zip(("s", "d"), regions):
                         ids = []
                         for index, metric in enumerate(by_region[region]):
@@ -328,20 +475,32 @@ def build_dashboard(account: str, application: str, regions: tuple[str, str], me
                             entry = [metric.namespace, metric.name]
                             for dimension_name, dimension_value in metric_dimensions(metric):
                                 entry.extend([dimension_name, dimension_value])
-                            entry.append({"id": metric_id, "region": region, "visible": False})
+                            entry.append({
+                                "id": metric_id,
+                                "region": region,
+                                "visible": show_individual_series,
+                                "label": f"{region} | {metric.resource_name}",
+                            })
                             series.append(entry)
                         expression = f"{function}([{','.join(ids)}])"
                         series.append([{"expression": expression, "id": f"e{prefix}", "region": region,
+                                        "visible": not show_individual_series,
                                         "label": f"{region} | {function.lower()} of {len(ids)} resources"}])
-                widgets.append({"type": "metric", "x": 0, "y": y, "width": 24, "height": 6,
+                widgets.append({"type": "metric", "x": metric_column * 12, "y": y, "width": 12, "height": 6,
                                 "properties": {"view": "timeSeries", "stacked": False, "region": regions[0],
                                 "period": period, "stat": stat, "title": f"{resource_type} | {label} ({stat}, {unit})", "metrics": series}})
+                metric_column += 1
+                if metric_column == 2:
+                    metric_column = 0
+                    y += 6
+            if metric_column:
                 y += 6
     else:
         # Backwards-compatible layout for callers outside the pair selector.
         groups = defaultdict(list)
         for metric in metrics:
             groups[(metric.resource_type, metric.name, metric.label, metric.statistic, metric.unit)].append(metric)
+        metric_column = 0
         for (resource_type, name, label, stat, unit), group in sorted(groups.items()):
             for offset in range(0, len(group), 500):
                 part = group[offset:offset + 500]
@@ -354,10 +513,13 @@ def build_dashboard(account: str, application: str, regions: tuple[str, str], me
                     series.append(entry)
                 title = f"{resource_type} | {label} ({stat}, {unit})"
                 if len(group) > 500: title += f" | part {offset // 500 + 1}"
-                widgets.append({"type": "metric", "x": 0, "y": y, "width": 24, "height": 6,
+                widgets.append({"type": "metric", "x": metric_column * 12, "y": y, "width": 12, "height": 6,
                                 "properties": {"view": "timeSeries", "stacked": False, "region": regions[0],
                                 "period": period, "stat": stat, "title": title, "metrics": series}})
-                y += 6
+                metric_column += 1
+                if metric_column == 2:
+                    metric_column = 0
+                    y += 6
     if len(widgets) > 500:
         raise ValueError("Selection exceeds the 500-widget CloudWatch dashboard limit; select fewer resources.")
     return {"start": "-PT6H", "periodOverride": "inherit", "widgets": widgets}
@@ -442,12 +604,26 @@ def _svg_line_chart(title: str, unit: str, regions: tuple[str, str], regional_re
 <text x="{left}" y="{height - 10}" class="tick">UTC {datetime.fromtimestamp(min_time, timezone.utc).strftime('%H:%M')}</text><text x="{left + plot_width - 72}" y="{height - 10}" class="tick">UTC {datetime.fromtimestamp(max_time, timezone.utc).strftime('%H:%M')}</text>{paths}</svg></figure>'''
 
 
-def render_html_report(profile: str, account: str, application: str, regions: tuple[str, str], start: datetime, end: datetime, results: list[MetricResult], period: int = 60) -> str:
+def _report_chart_title(resource_type: str, metric_name: str, label: str) -> str:
+    if resource_type in {"APIGateway", "APIGatewayV2"}:
+        if metric_name == "Count":
+            return "API Gateway calls"
+        if metric_name == "Latency":
+            return "API Gateway response time / tm99"
+        return f"API Gateway {label}"
+    return f"{resource_type} | {label}"
+
+
+def render_html_report(profile: str, account: str, application: str, regions: tuple[str, str], start: datetime, end: datetime, results: list[MetricResult], period: int = 60, selected_metric_keys: set[str] | None = None) -> str:
     """Create a self-contained, evidence-oriented comparison report.
 
     Values are derived only from returned CloudWatch points. In particular,
     absent data remains absent and is never converted to a zero.
     """
+    if selected_metric_keys is not None:
+        results = [result for result in results if report_metric_key(result.metric) in selected_metric_keys]
+    if not results:
+        raise ValueError("Select at least one metric for the DR evidence report.")
     duration_minutes = max((end - start).total_seconds() / 60, 1)
     by_comparison: dict[str, list[MetricResult]] = defaultdict(list)
     for result in results:
@@ -480,21 +656,27 @@ def render_html_report(profile: str, account: str, application: str, regions: tu
                     cells.append(f"<td><strong>Mean: {format_metric_value(mean)} {escape(unit)}</strong><br><small>Min: {format_metric_value(min(points))} | Max: {format_metric_value(max(points))} | Samples: {len(points)} | {note}</small></td>")
             rows.append(f"<tr><th>{escape(label)}</th>{''.join(cells)}</tr>")
         charts = []
-        if resource_type in {"APIGateway", "APIGatewayV2"}:
-            for metric_name, chart_title, chart_unit in (
-                ("Count", "API Gateway calls", f"calls per {period}-second period"),
-                ("Latency", "API Gateway response time / tm99", "milliseconds"),
-            ):
-                regional_results = {
-                    region: [item for item in comparison_results if item.metric.name == metric_name and item.metric.region == region]
-                    for region in regions
-                }
-                charts.append(_svg_line_chart(chart_title, chart_unit, regions, regional_results))
+        for (metric_name, label, unit), values in metric_groups.items():
+            statistic = values[0].metric.statistic
+            chart_unit = (
+                f"{unit} per {period}-second period"
+                if statistic in {"Sum", "SampleCount"} else unit
+            )
+            regional_results = {
+                region: [item for item in values if item.metric.region == region]
+                for region in regions
+            }
+            charts.append(_svg_line_chart(
+                _report_chart_title(resource_type, metric_name, label),
+                chart_unit,
+                regions,
+                regional_results,
+            ))
         sections.append(f"<section><h2>{escape(resource_type)} · {escape(comparison)}</h2>{''.join(charts)}<table><thead><tr><th>Metric</th><th>{escape(regions[0])}</th><th>{escape(regions[1])}</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section>")
     return f"""<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{escape(profile)} - Disaster Recovery</title>
 <style>body{{background:#0b1010;color:#e8e1d3;font:14px Segoe UI,Arial,sans-serif;margin:32px}}h1{{color:#e0b66d}}h2{{color:#e0b66d;margin:0 0 12px}}section{{background:#111818;border:1px solid #394241;padding:18px;margin:18px 0}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #394241;padding:10px;text-align:left;vertical-align:top}}th{{background:#171f1f;color:#e0b66d}}small{{color:#abb3ad}}.notice,.chart-empty{{color:#cfaa78}}.chart{{border:1px solid #2d3938;background:#0d1414;padding:14px;margin:16px 0}}.chart figcaption{{font-weight:700;color:#e0b66d;margin-bottom:7px}}.legend{{display:flex;gap:18px;margin:0 0 7px;color:#abb3ad;font-size:12px}}.legend i{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px}}svg{{width:100%;height:auto;background:#0b1010}}.axis{{stroke:#475351;stroke-width:1}}.tick{{fill:#abb3ad;font-size:11px}}</style></head><body>
 <h1>{escape(profile)} — Disaster Recovery evidence</h1><p>Account: <strong>{escape(account)}</strong> · Application: <strong>{escape(application)}</strong><br>Source: <strong>{escape(regions[0])}</strong> · DR: <strong>{escape(regions[1])}</strong><br>UTC interval: {escape(start.isoformat())} — {escape(end.isoformat())}</p>
-<p class=\"notice\">API Gateway native metrics only. API calls use SampleCount over {period}-second periods. Missing data is not zero. Latency labelled tm99 excludes the highest 1% of raw samples where CloudWatch supports it.</p>{''.join(sections)}</body></html>"""
+<p class=\"notice\">Native CloudWatch metrics only; SpiceConex does not enable additional monitoring. Missing data is not zero. API Gateway is the external API traffic boundary. Load-balancer metrics can also include health checks or service-to-service traffic and must be interpreted as infrastructure evidence. API latency labelled tm99 excludes the highest 1% of raw samples where CloudWatch supports it.</p>{''.join(sections)}</body></html>"""
 
 
 def publish_new_dashboard(profile: str, account: str, region: str, application: str, body: dict) -> tuple[str, list]:
