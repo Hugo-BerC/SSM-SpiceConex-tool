@@ -1468,6 +1468,18 @@ class Route53Page(BasePage):
                 return self.zones_by_id.get(self.zone_selector.itemData(index))
         return None
 
+    @staticmethod
+    def _zone_details(zone):
+        """Keep the selector readable; expose operational metadata separately."""
+        details = [
+            f"Selected: {zone['Name']}",
+            f"{zone['RecordSetCount']} record set(s)",
+            f"Hosted zone ID: {zone['Id']}",
+        ]
+        if zone.get("Comment"):
+            details.append(f"Comment: {zone['Comment']}")
+        return " · ".join(details)
+
     def _zone_changed(self, _index):
         zone = self._selected_zone()
         self.discover_records.setEnabled(zone is not None and self.thread is None)
@@ -1475,7 +1487,7 @@ class Route53Page(BasePage):
             return
         self.selected_zone = zone
         self.records_table.set_rows([]); self.records_export.setEnabled(False); self.record_count.setText("0 / 0 records")
-        self.summary.setText(f"{len(self.zones_by_id)} private hosted zones discovered · Selected: {zone['Name']}")
+        self.summary.setText(f"{len(self.zones_by_id)} private hosted zones discovered · {self._zone_details(zone)}")
 
     def _start_worker(self, job, operation):
         self.job = job; self.refresh_zones.setEnabled(False); self.discover_records.setEnabled(False)
@@ -1505,21 +1517,20 @@ class Route53Page(BasePage):
             zones = result.get("zones", []); self.zones_by_id = {zone["Id"]: zone for zone in zones}; self.selected_zone = None
             self.zone_selector.blockSignals(True); self.zone_selector.clear()
             for zone in zones:
-                suffix = f"{zone['RecordSetCount']} records"
-                if zone.get("Comment"):
-                    suffix += f" · {zone['Comment']}"
-                self.zone_selector.addItem(f"{zone['Name']}  ·  {suffix}  ·  {zone['Id']}", zone["Id"])
+                # The dropdown is deliberately name-only. IDs, record-set
+                # counts and comments remain available after selection below.
+                self.zone_selector.addItem(zone["Name"], zone["Id"])
             self.zone_selector.setCurrentIndex(0 if zones else -1); self.zone_selector.blockSignals(False)
             self.records_table.set_rows([]); self.records_export.setEnabled(False); self.record_count.setText("0 / 0 records")
             if zones:
                 self.selected_zone = zones[0]; self.discover_records.setEnabled(True)
-                self.summary.setText(f"{len(zones)} private hosted zones discovered · Select one and discover its DNS records."); self.status.setText("●  PHZ INVENTORY READY")
+                self.summary.setText(f"{len(zones)} private hosted zones discovered · {self._zone_details(zones[0])} · Discover its DNS records."); self.status.setText("●  PHZ INVENTORY READY")
             else:
                 self.summary.setText("No private hosted zones are visible to the selected AWS profile."); self.status.setText("●  NO PRIVATE HOSTED ZONES")
         else:
             records = result.get("records", []); self.records_table.set_rows(records); self.records_export.setEnabled(bool(records)); self.record_count.setText(self.records_table.count_text("records"))
             zone = self.selected_zone or {"Name": result.get("hosted_zone_id", "selected zone")}
-            self.summary.setText(f"{zone['Name']} · {len(records)} DNS records discovered."); self.status.setText("●  RECORDS READY")
+            self.summary.setText(f"{self._zone_details(zone)} · {len(records)} DNS records discovered."); self.status.setText("●  RECORDS READY")
         logger.info("Route 53 UI updated | job=%s", self.job)
 
     @Slot(object)

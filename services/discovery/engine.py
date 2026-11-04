@@ -289,12 +289,19 @@ def _discover_region(session, graph, region, account_id, tag_key):
     elb = session.client("elbv2", region_name=region, config=_config())
     tg_by_arn = {}
     load_balancer_arns = []
+    load_balancer_types = {}
     try:
         for lb in _paginate(elb, "describe_load_balancers", "LoadBalancers"):
             lb_id = lb["LoadBalancerArn"]
             load_balancer_arns.append(lb_id)
             tags = _safe_tags(lambda arn=lb_id: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []))
-            _add(graph, lb_id, lb_id, "ALB" if lb.get("Type") == "application" else "NLB", lb.get("LoadBalancerName", lb_id), region, account_id, tags, VpcId=lb.get("VpcId"), Scheme=lb.get("Scheme", ""))
+            lb_type = {
+                "application": "ALB",
+                "network": "NLB",
+                "gateway": "GWLB",
+            }.get(lb.get("Type"), "ELBv2")
+            load_balancer_types[lb_id] = lb_type
+            _add(graph, lb_id, lb_id, lb_type, lb.get("LoadBalancerName", lb_id), region, account_id, tags, VpcId=lb.get("VpcId"), Scheme=lb.get("Scheme", ""))
             if lb.get("VpcId") in vpc_by_id:
                 add_relation(graph, lb.get("VpcId"), lb_id, "contains")
             for subnet in lb.get("AvailabilityZones", []):
@@ -304,8 +311,20 @@ def _discover_region(session, graph, region, account_id, tag_key):
 
         for tg in _paginate(elb, "describe_target_groups", "TargetGroups"):
             arn = tg["TargetGroupArn"]
+            associated_balancers = tuple(tg.get("LoadBalancerArns", []))
+            associated_types = {load_balancer_types.get(lb_arn) for lb_arn in associated_balancers}
+            associated_types.discard(None)
+            target_group_type = (
+                f"{next(iter(associated_types))}TargetGroup"
+                if len(associated_types) == 1 and next(iter(associated_types)) in {"ALB", "NLB", "GWLB"}
+                else "TargetGroup"
+            )
             tags = _safe_tags(lambda arn=arn: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []))
-            tg_by_arn[arn] = _add(graph, arn, arn, "TargetGroup", tg.get("TargetGroupName", arn), region, account_id, tags, Protocol=tg.get("Protocol", ""), Port=tg.get("Port"), TargetType=tg.get("TargetType", ""), VpcId=tg.get("VpcId"))
+            tg_by_arn[arn] = _add(
+                graph, arn, arn, target_group_type, tg.get("TargetGroupName", arn), region, account_id, tags,
+                Protocol=tg.get("Protocol", ""), Port=tg.get("Port"), TargetType=tg.get("TargetType", ""),
+                VpcId=tg.get("VpcId"), LoadBalancerArns=associated_balancers,
+            )
             if tg.get("VpcId") in vpc_by_id:
                 add_relation(graph, tg.get("VpcId"), arn, "contains")
             try:

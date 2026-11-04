@@ -149,6 +149,10 @@ def _metadata(item: dict[str, Any], configuration: dict[str, Any], config_type: 
         metadata["SubnetId"] = subnet_id
     if availability_zone:
         metadata["AvailabilityZone"] = availability_zone
+    if config_type == "AWS::ElasticLoadBalancingV2::TargetGroup":
+        load_balancer_arns = _value(configuration, "loadBalancerArns", "LoadBalancerArns")
+        if isinstance(load_balancer_arns, list):
+            metadata["LoadBalancerArns"] = tuple(str(arn) for arn in load_balancer_arns if arn)
     return metadata
 
 

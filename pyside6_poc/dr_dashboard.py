@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from services.dr_dashboard import ComparisonPair, TEMPLATES, artifact_prefix, build_dashboard, build_pair_metrics, dashboard_name_for_profile, format_metric_value, metric_dimensions, publish_new_dashboard, query_metrics, render_html_report
+from services.dr_dashboard import ComparisonPair, TEMPLATES, artifact_prefix, build_dashboard, build_pair_metrics, dashboard_name_for_profile, format_metric_value, metric_dimensions, publish_new_dashboard, query_metrics, render_html_report, report_metric_key, resource_metric_dimensions, supports_metric_resource
 from utils.csv_safety import csv_safe_value
 from app.config import AWS_REGIONS
 
@@ -136,11 +136,12 @@ class DRDashboardPage(QWidget):
         self.context = QLabel("Run Architecture discovery for two regions to prepare a DR dashboard."); self.context.setWordWrap(True); self.context.setObjectName("footerText"); root.addWidget(self.context)
         self.tabs = QTabWidget(); self.tabs.setObjectName("inventoryTabs")
         resource_page = QWidget(); resource_layout = QVBoxLayout(resource_page); resource_layout.setContentsMargins(4, 8, 4, 4)
-        hint = QLabel("Select API Gateway resources explicitly. API Gateway is the DR source of truth for external API traffic; ALB traffic can include service-to-service calls. No logs are enabled or queried."); hint.setWordWrap(True); hint.setObjectName("footerText"); resource_layout.addWidget(hint)
+        hint = QLabel("Select discovered architectural resources with supported CloudWatch metrics. API Gateway remains the source of truth for external API traffic; load-balancer traffic may include health checks or service-to-service calls. No logs or metrics are enabled by SpiceConex."); hint.setWordWrap(True); hint.setObjectName("footerText"); resource_layout.addWidget(hint)
         filters = QHBoxLayout(); filters.setSpacing(8)
         filter_label = QLabel("FILTER RESOURCES"); filter_label.setObjectName("microLabel"); filters.addWidget(filter_label)
-        self.resource_filter = QLineEdit(); self.resource_filter.setPlaceholderText("API name, ID, region or attribution"); self.resource_filter.setClearButtonEnabled(True); self.resource_filter.setMinimumWidth(300); filters.addWidget(self.resource_filter, 1)
+        self.resource_filter = QLineEdit(); self.resource_filter.setPlaceholderText("Resource name, ID, type, region or attribution"); self.resource_filter.setClearButtonEnabled(True); self.resource_filter.setMinimumWidth(300); filters.addWidget(self.resource_filter, 1)
         self.resource_type_filter = QComboBox(); self.resource_type_filter.addItem("ALL TYPES"); self.resource_type_filter.setMinimumWidth(150); filters.addWidget(self.resource_type_filter)
+        self.alb_metric_level = QComboBox(); self.alb_metric_level.addItems(["LOAD BALANCERS", "TARGET GROUPS"]); self.alb_metric_level.setMinimumWidth(160); self.alb_metric_level.setVisible(False); filters.addWidget(self.alb_metric_level)
         self.selected_only = QCheckBox("SHOW SELECTED ONLY"); self.selected_only.setObjectName("footerText"); filters.addWidget(self.selected_only)
         self.resource_visible_count = QLabel("0 / 0 resources"); self.resource_visible_count.setObjectName("sectionCounter"); filters.addWidget(self.resource_visible_count)
         resource_layout.addLayout(filters)
@@ -169,6 +170,18 @@ class DRDashboardPage(QWidget):
         self.preview = MetricPreview(); preview_layout.addWidget(self.preview, 1)
         self.metric_table = QTableWidget(0, 6); self.metric_table.setHorizontalHeaderLabels(["Region", "Resource", "Metric", "Status", "Last value", "Details"])
         self.metric_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.metric_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents); self.metric_table.horizontalHeader().setStretchLastSection(True); self.metric_table.setMaximumHeight(190); preview_layout.addWidget(self.metric_table)
+        self.report_metric_panel = QFrame(); self.report_metric_panel.setObjectName("operationPanel")
+        report_layout = QVBoxLayout(self.report_metric_panel); report_layout.setContentsMargins(12, 10, 12, 10); report_layout.setSpacing(6)
+        report_header = QHBoxLayout()
+        report_title = QLabel("DR REPORT VISUALS"); report_title.setObjectName("microLabel"); report_header.addWidget(report_title)
+        self.report_metric_summary = QLabel("Select the metrics to include as two-region visuals in the HTML evidence report."); self.report_metric_summary.setObjectName("footerText"); report_header.addWidget(self.report_metric_summary, 1)
+        self.report_select_all = QPushButton("SELECT ALL"); self.report_select_all.setObjectName("quietButton"); report_header.addWidget(self.report_select_all)
+        self.report_clear = QPushButton("CLEAR"); self.report_clear.setObjectName("quietButton"); report_header.addWidget(self.report_clear)
+        report_layout.addLayout(report_header)
+        self.report_metric_options = QWidget(); self.report_metric_options_layout = QGridLayout(self.report_metric_options); self.report_metric_options_layout.setContentsMargins(0, 0, 0, 0); self.report_metric_options_layout.setHorizontalSpacing(18); self.report_metric_options_layout.setVerticalSpacing(4)
+        report_layout.addWidget(self.report_metric_options)
+        self.report_metric_controls = {}
+        self.report_metric_panel.setVisible(False); preview_layout.addWidget(self.report_metric_panel)
         self.tabs.addTab(preview_page, "METRIC PREVIEW")
         root.addWidget(self.tabs, 1)
         self.actions_panel = QFrame(); actions = QHBoxLayout(self.actions_panel); actions.setContentsMargins(0, 0, 0, 0)
@@ -183,7 +196,11 @@ class DRDashboardPage(QWidget):
         self.add_pair.clicked.connect(self.add_comparison_pair); self.remove_pair.clicked.connect(self.remove_comparison_pair); self.clear_selection.clicked.connect(self.clear_resource_selection); self.toggle_pairs.clicked.connect(self.toggle_pair_section)
         self.resource_filter.textChanged.connect(self._filter_resource_rows)
         self.resource_type_filter.currentTextChanged.connect(self._filter_resource_rows)
+        self.resource_type_filter.currentTextChanged.connect(self._update_alb_metric_level)
+        self.alb_metric_level.currentTextChanged.connect(self._filter_resource_rows)
         self.selected_only.toggled.connect(self._filter_resource_rows)
+        self.report_select_all.clicked.connect(lambda: self._set_all_report_metrics(True))
+        self.report_clear.clicked.connect(lambda: self._set_all_report_metrics(False))
         self.export_html.clicked.connect(self.save_html); self.export_json.clicked.connect(self.save_json); self.export_csv.clicked.connect(self.save_csv); self.export_png.clicked.connect(self.save_png); self.publish.clicked.connect(self.publish_dashboard)
         self.invalidate()
 
@@ -249,12 +266,13 @@ class DRDashboardPage(QWidget):
                 self._filter_resource_rows()
                 return
             scoped = self.graph.scoped(self.application, self.tag_key)
-            # DR traffic evidence is intentionally limited to the public API
-            # boundary. The full inventory remains available in its own tab.
-            api_gateway_types = set(TEMPLATES)
+            # Present only architectural resources for which SpiceConex can
+            # construct a valid native CloudWatch metric query. Structural
+            # resources remain available in the inventory and diagram tabs.
+            metric_resource_types = set(TEMPLATES)
             nodes = sorted((
                 n for n in scoped.nodes.values()
-                if n.region in regions and n.resource_type in api_gateway_types
+                if n.region in regions and n.resource_type in metric_resource_types and supports_metric_resource(n)
             ), key=lambda n: (n.region, n.resource_type, n.name or n.id))
             # A current graph normally has a single canonical node per API
             # Gateway after Config/live merging.  Retain this defensive view
@@ -263,7 +281,7 @@ class DRDashboardPage(QWidget):
             # native API identifier.
             unique_nodes = {}
             for node in nodes:
-                identity = node.id
+                identity = resource_metric_dimensions(node)
                 if node.resource_type in {"APIGateway", "APIGatewayV2"}:
                     # REST API metrics are keyed by ApiName.  If Config does
                     # not expose an ARN/API ID, same-name APIs of the same
@@ -292,21 +310,28 @@ class DRDashboardPage(QWidget):
                 check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable)
                 check.setCheckState(Qt.CheckState.Unchecked)
                 self.resources.setItem(row, 0, check)
-                for col, value in enumerate((node.region, node.resource_type, node.name or node.id, attribution), 1):
+                display_type = {
+                    "ALBTargetGroup": "ALB TARGET GROUP",
+                    "NLBTargetGroup": "NLB TARGET GROUP",
+                    "GWLBTargetGroup": "GWLB TARGET GROUP",
+                }.get(node.resource_type, node.resource_type)
+                for col, value in enumerate((node.region, display_type, node.name or node.id, attribution), 1):
                     item = QTableWidgetItem(str(value)); item.setToolTip(node.id); self.resources.setItem(row, col, item)
         self.resource_type_filter.blockSignals(True)
         self.resource_type_filter.clear(); self.resource_type_filter.addItem("ALL TYPES")
-        types = sorted({self.resources.item(row, 2).text() for row in range(self.resources.rowCount()) if self.resources.item(row, 2)})
+        target_group_labels = {"ALB TARGET GROUP", "NLB TARGET GROUP", "GWLB TARGET GROUP"}
+        types = sorted({self.resources.item(row, 2).text() for row in range(self.resources.rowCount()) if self.resources.item(row, 2) and self.resources.item(row, 2).text() not in target_group_labels})
         self.resource_type_filter.addItems(types)
         saved_index = self.resource_type_filter.findText(previous_type)
         self.resource_type_filter.setCurrentIndex(saved_index if saved_index >= 0 else 0)
         self.resource_type_filter.blockSignals(False)
+        self._update_alb_metric_level()
         self._populating = False
         self.invalidate()
         self._filter_resource_rows()
         if self.graph:
             warning = f" | Discovery warnings: {len(self.graph.warnings)} (see Architecture status)" if self.graph.warnings else ""
-            self.context.setText(f"Account {self.graph.account_id} | {self.application} | {len(self.graph.regions)} discovered region(s) | {self.resources.rowCount()} API Gateway candidate(s){warning}. API Gateway native metrics only.")
+            self.context.setText(f"Account {self.graph.account_id} | {self.application} | {len(self.graph.regions)} discovered region(s) | {self.resources.rowCount()} metric-capable architectural resource(s){warning}. Native CloudWatch metrics only.")
             self.context.setToolTip("\n".join(self.graph.warnings))
         else:
             self.context.setText("Run Architecture discovery for two regions to prepare a DR dashboard.")
@@ -320,7 +345,15 @@ class DRDashboardPage(QWidget):
         for row in range(self.resources.rowCount()):
             values = [self.resources.item(row, column).text() if self.resources.item(row, column) else "" for column in range(1, 5)]
             checked = self.resources.item(row, 0) and self.resources.item(row, 0).checkState() == Qt.CheckState.Checked
-            matches = (not query or query in " ".join(values).casefold()) and (resource_type == "ALL TYPES" or values[1] == resource_type) and (not selected_only or checked)
+            if resource_type in {"ALB", "NLB", "GWLB"}:
+                expected_type = f"{resource_type} TARGET GROUP" if self.alb_metric_level.currentText() == "TARGET GROUPS" else resource_type
+                type_matches = values[1] == expected_type
+            else:
+                # ALL TYPES is a complete inventory view. Target groups can
+                # also be isolated through ALB / TARGET GROUPS, but must not
+                # disappear from the unfiltered cross-region comparison.
+                type_matches = resource_type == "ALL TYPES" or values[1] == resource_type
+            matches = (not query or query in " ".join(values).casefold()) and type_matches and (not selected_only or checked)
             self.resources.setRowHidden(row, not matches)
             visible += int(matches)
         selected = sum(
@@ -328,6 +361,10 @@ class DRDashboardPage(QWidget):
             for row in range(self.resources.rowCount())
         )
         self.resource_visible_count.setText(f"{visible} visible / {self.resources.rowCount()} total | {selected} selected")
+
+    def _update_alb_metric_level(self, *_args):
+        self.alb_metric_level.setVisible(self.resource_type_filter.currentText() in {"ALB", "NLB", "GWLB"})
+        self._filter_resource_rows()
 
     def _resource_item_changed(self, *_args):
         self.invalidate()
@@ -417,6 +454,59 @@ class DRDashboardPage(QWidget):
             button.setEnabled(False)
         self.actions_panel.setVisible(False)
         self.preview.scene.clear(); self.metric_table.setRowCount(0)
+        self.report_metric_panel.setVisible(False)
+        self._clear_report_metric_options()
+
+    def _clear_report_metric_options(self):
+        while self.report_metric_options_layout.count():
+            item = self.report_metric_options_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.report_metric_controls = {}
+
+    def _prepare_report_metric_options(self, results):
+        """Create one operator-controlled report option for each returned metric."""
+        self._clear_report_metric_options()
+        metrics = {}
+        for result in results:
+            metric = result.metric
+            metrics.setdefault(report_metric_key(metric), metric)
+        for index, (key, metric) in enumerate(sorted(metrics.items(), key=lambda item: (
+            item[1].resource_type, item[1].label, item[1].name, item[1].statistic,
+        ))):
+            control = QCheckBox(f"{metric.resource_type} · {metric.label} ({metric.statistic})")
+            # For container services the operational task count is the primary
+            # DR evidence. CPU/memory fleet averages remain available, but do
+            # not enter the executive HTML report unless explicitly selected.
+            default_checked = not (
+                metric.resource_type == "ECS" and metric.name in {"CPUUtilization", "MemoryUtilization"}
+            )
+            control.setChecked(default_checked)
+            control.setToolTip(
+                "Adds this metric as a two-region chart and evidence row to the exported DR HTML report."
+            )
+            control.toggled.connect(self._report_metric_selection_changed)
+            self.report_metric_options_layout.addWidget(control, index // 2, index % 2)
+            self.report_metric_controls[key] = control
+        self.report_metric_panel.setVisible(bool(self.report_metric_controls))
+        self._report_metric_selection_changed()
+
+    def _selected_report_metric_keys(self):
+        return {key for key, control in self.report_metric_controls.items() if control.isChecked()}
+
+    def _set_all_report_metrics(self, checked):
+        for control in self.report_metric_controls.values():
+            control.setChecked(checked)
+        self._report_metric_selection_changed()
+
+    def _report_metric_selection_changed(self, *_args):
+        selected = len(self._selected_report_metric_keys())
+        total = len(self.report_metric_controls)
+        self.report_metric_summary.setText(
+            f"{selected} / {total} metrics selected for the visual HTML evidence report."
+        )
+        if self.prepared:
+            self.export_html.setEnabled(bool(selected))
 
     def _selected_nodes(self):
         return [self.graph.nodes[item.data(Qt.ItemDataRole.UserRole)] for row in range(self.resources.rowCount())
@@ -476,7 +566,9 @@ class DRDashboardPage(QWidget):
             body = build_dashboard(self.graph.account_id, self.application, regions, metrics, period)
         except ValueError as exc:
             QMessageBox.warning(self, "DR dashboard", str(exc)); return
-        body["start"] = start.isoformat().replace("+00:00", "Z"); body["end"] = end.isoformat().replace("+00:00", "Z")
+        # The selected interval belongs to the evidence query and its exports.
+        # Keep the CloudWatch dashboard on its rolling default (-PT6H) so it is
+        # operationally useful whenever it is opened later.
         account = self.graph.account_id; context = self.context_key; application = self.application; self.invalidate(); revision = self._revision
         self.context.setText(f"Reading existing CloudWatch metrics | account {account} | {regions[0]} / {regions[1]} | {len(metrics)} series...")
         if self.demo:
@@ -503,8 +595,10 @@ class DRDashboardPage(QWidget):
         warning = f" | {len(data['skipped'])} selected resource(s) without template" if data["skipped"] else ""
         self.context.setText(f"Account {data['account']} | {data['application']} | {data['regions'][0]} / {data['regions'][1]} | DATA {counts['DATA']} | NO DATA {counts['NO DATA']} | INCOMPLETE {counts['INCOMPLETE']} | ERROR {counts['ERROR']}{warning}. Missing data is not zero; shared resources may include other applications.")
         self.context.setToolTip("\n".join(list(self.graph.warnings) + data["skipped"]))
+        self._prepare_report_metric_options(results)
         for button in (self.export_html, self.export_json, self.export_csv, self.export_png):
             button.setEnabled(True)
+        self._report_metric_selection_changed()
         self.actions_panel.setVisible(True)
         self.tabs.setCurrentIndex(1)
 
@@ -519,11 +613,15 @@ class DRDashboardPage(QWidget):
 
     def save_html(self):
         if not self.prepared: return
+        selected_metric_keys = self._selected_report_metric_keys()
+        if not selected_metric_keys:
+            QMessageBox.warning(self, "DR report", "Select at least one metric to include in the HTML evidence report.")
+            return
         prefix = artifact_prefix(self.prepared["profile"])
         path, _ = QFileDialog.getSaveFileName(self, "Export DR evidence report", f"{prefix}-Disaster_Recovery-report.html", "HTML (*.html)")
         if path:
             try:
-                report = render_html_report(self.prepared["profile"], self.prepared["account"], self.prepared["application"], self.prepared["regions"], self.prepared["start"], self.prepared["end"], self.prepared["results"], self.prepared["period"])
+                report = render_html_report(self.prepared["profile"], self.prepared["account"], self.prepared["application"], self.prepared["regions"], self.prepared["start"], self.prepared["end"], self.prepared["results"], self.prepared["period"], selected_metric_keys)
                 with open(path, "w", encoding="utf-8") as file: file.write(report)
             except OSError as exc: self.show_error(exc)
 
