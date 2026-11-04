@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import webbrowser
 from urllib.parse import quote
 
@@ -82,7 +83,15 @@ def login_profile(profile: str) -> str | None:
     if not aws_path:
         raise RuntimeError("AWS CLI not found in PATH. SSO login requires AWS CLI v2.")
 
-    args = [aws_path, "sso", "login", "--profile", profile, "--no-browser"]
+    # On Windows, AWS CLI can retain its device-flow output when stdout is a
+    # pipe.  Waiting for that text means SpiceConex never reaches the URL and
+    # the operator sees no browser. Delegate browser opening to AWS CLI there.
+    # Other platforms retain the explicit no-browser flow because it lets us
+    # open the complete code-bearing URL ourselves.
+    native_browser = sys.platform == "win32"
+    args = [aws_path, "sso", "login", "--profile", profile]
+    if not native_browser:
+        args.append("--no-browser")
     logger.info("Starting AWS SSO login | profile=%r", profile)
     process = subprocess.Popen(
         args,
@@ -94,7 +103,9 @@ def login_profile(profile: str) -> str | None:
     )
     output: list[str] = []
     opened_url: str | None = None
-    if process.stdout:
+    if native_browser:
+        logger.info("Delegating AWS SSO browser launch to AWS CLI on Windows | profile=%r", profile)
+    elif process.stdout:
         for raw_line in process.stdout:
             line = raw_line.rstrip()
             output.append(line)
