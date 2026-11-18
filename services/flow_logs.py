@@ -8,7 +8,7 @@ import io
 import re
 from datetime import datetime, timezone
 
-from aws.session import get_boto3_session, get_ec2_client
+from aws.session import get_boto3_session, get_ec2_client, get_client
 from utils.logging import get_logger
 
 
@@ -138,9 +138,9 @@ def analyse_s3_flow_log(profile: str, region: str, flow_log: dict, interface_id:
         raise ValueError("Select an interface and a valid date range.")
     fields = _format_fields(flow_log.get("LogFormat") or DEFAULT_FLOW_FORMAT)
     session = get_boto3_session(profile, region)
-    account_id = session.client("sts").get_caller_identity().get("Account", "")
+    account_id = get_client("sts", session=session).get_caller_identity().get("Account", "")
     bucket, prefix = _s3_destination(flow_log.get("LogDestination", ""))
-    s3 = session.client("s3")
+    s3 = get_client("s3", session=session)
     hive = bool((flow_log.get("DestinationOptions") or {}).get("HiveCompatiblePartitions"))
     keys = []
     for key_prefix in _s3_prefixes(prefix, account_id, region, start, end, hive):
@@ -308,7 +308,7 @@ def _rows(results: list[list[dict]], networks, interface_ips=(), normalise_ports
         key = (origin, destination_value, value("protocol"), str(service_port), value("action"), direction, scope)
         target = normalised.setdefault(key, {
             "Origin": origin, "Destination": destination_value, "Protocol": value("protocol"),
-            "Port": str(service_port), "Result": item.get("action", ""), "Direction": direction,
+            "Port": str(service_port), "Result": value("action"), "Direction": direction,
             "Scope": scope, "Observations": 0, "Bytes": 0, "RawGroups": 0,
         })
         target["Observations"] += count
@@ -324,7 +324,7 @@ def analyse_flow_log(profile: str, region: str, flow_log: dict, start: datetime,
         raise RuntimeError("This Flow Log is not delivered to CloudWatch Logs and cannot be queried from the application.")
     if end <= start:
         raise ValueError("The end date must be later than the start date.")
-    logs = get_boto3_session(profile, region).client("logs")
+    logs = get_client("logs", profile, region)
     query_id = logs.start_query(
         logGroupName=flow_log["LogGroupName"], startTime=int(start.replace(tzinfo=timezone.utc).timestamp()),
         endTime=int(end.replace(tzinfo=timezone.utc).timestamp()), queryString=build_insights_query(flow_log.get("LogFormat") or DEFAULT_FLOW_FORMAT, interface_id, aggregation=aggregation),

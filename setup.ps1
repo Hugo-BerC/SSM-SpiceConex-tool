@@ -2,7 +2,11 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $AppDir = (Resolve-Path $PSScriptRoot).Path
-$RuntimeRoot = Join-Path $env:LOCALAPPDATA 'SSM-SpiceConex'
+if (Test-Path -LiteralPath (Join-Path $AppDir '.spiceconex-update.lock')) {
+    throw 'An update/recovery lock exists. Review its journal before running setup.'
+}
+$LocalRuntimeBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { [Environment]::GetFolderPath('UserProfile') }
+$RuntimeRoot = Join-Path $LocalRuntimeBase 'SSM-SpiceConex'
 $VenvDir = Join-Path $RuntimeRoot 'venv'
 $LauncherDir = Join-Path $RuntimeRoot 'bin'
 $ActiveInstallFile = Join-Path $RuntimeRoot 'active-installation.json'
@@ -50,7 +54,7 @@ function Test-Command {
 function Test-Python {
     param([string]$Command)
     try {
-        & $Command -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' *> $null
+        & $Command -c 'import sys,struct; raise SystemExit(0 if sys.version_info >= (3,10) and struct.calcsize("P")==8 else 1)' *> $null
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
@@ -86,6 +90,13 @@ function Get-PluginVersion {
     return $null
 }
 
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()][string]$Value)
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
 function Run-Quiet {
     param(
         [string]$Label,
@@ -97,7 +108,8 @@ function Run-Quiet {
     $stderr = Join-Path $env:TEMP ('spiceconex-' + [guid]::NewGuid().ToString('N') + '.err')
 
     Write-Host ('[|] ' + $Label) -NoNewline
-    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $nativeArguments = ($ArgumentList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+    $process = Start-Process -FilePath $FilePath -ArgumentList $nativeArguments -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     if ($process.ExitCode -ne 0) {
         Write-Host "`r[FAIL] $Label" -ForegroundColor Red
         if (Test-Path $stderr) { Get-Content $stderr | Select-Object -Last 30 | Write-Host }
@@ -116,7 +128,7 @@ Write-Step ('Application directory: ' + $AppDir)
 # Python
 $PythonCommand = $null
 foreach ($candidate in @('py', 'python')) {
-    if (Test-Command $candidate -and (Test-Python $candidate)) {
+    if ((Test-Command $candidate) -and (Test-Python $candidate)) {
         $PythonCommand = $candidate
         break
     }
@@ -134,7 +146,7 @@ if (-not $PythonCommand) {
 
     Refresh-Path
     foreach ($candidate in @('py', 'python')) {
-        if (Test-Command $candidate -and (Test-Python $candidate)) {
+        if ((Test-Command $candidate) -and (Test-Python $candidate)) {
             $PythonCommand = $candidate
             break
         }
@@ -230,13 +242,17 @@ if (-not (Test-Path $VenvPython)) { throw ('Python virtual environment is incomp
 
 Run-Quiet 'Installing Python package manager' $VenvPython @('-m','pip','install','--upgrade','pip','--disable-pip-version-check','--no-input')
 Run-Quiet 'Installing SpiceConex Python modules' $VenvPython @('-m','pip','install','-r',(Join-Path $AppDir 'requirements.txt'),'--disable-pip-version-check','--no-input')
+Run-Quiet 'Checking Python dependency compatibility' $VenvPython @('-m','pip','check')
+Run-Quiet 'Checking application imports' $VenvPython @((Join-Path $AppDir 'app\installation.py'),'--check',$AppDir)
 
 # Launcher
 $CmdPath = Join-Path $LauncherDir 'spiceconex.cmd'
 $LauncherTarget = Join-Path $AppDir 'ssm_spiceconex.py'
 New-Item -ItemType Directory -Force -Path $LauncherDir | Out-Null
-$launcherText = '@echo off' + [Environment]::NewLine + '"' + $VenvPython + '" "' + $LauncherTarget + '" %*' + [Environment]::NewLine
-[IO.File]::WriteAllText($CmdPath, $launcherText, [Text.Encoding]::ASCII)
+$launcherPython = $VenvPython.Replace('%', '%%')
+$launcherScript = $LauncherTarget.Replace('%', '%%')
+$launcherText = '@echo off' + [Environment]::NewLine + 'setlocal DisableDelayedExpansion' + [Environment]::NewLine + 'chcp 65001 >nul' + [Environment]::NewLine + '"' + $launcherPython + '" "' + $launcherScript + '" %*' + [Environment]::NewLine
+[IO.File]::WriteAllText($CmdPath, $launcherText, [Text.UTF8Encoding]::new($false))
 
 $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $entries = @()
@@ -253,14 +269,7 @@ if ($entries -notcontains $LauncherDir) {
 $currentEntries = @($env:Path -split ';' | Where-Object { $_ -ne $AppDir -and $_ -ne $PreviousAppDir } | Select-Object -Unique)
 $env:Path = (@($LauncherDir) + $currentEntries) -join ';'
 
-$activeInstall = [ordered]@{
-    schema = 1
-    app_dir = $AppDir
-    python = $VenvPython
-    launcher = $CmdPath
-    installed_at_utc = [DateTime]::UtcNow.ToString('o')
-}
-[IO.File]::WriteAllText($ActiveInstallFile, ($activeInstall | ConvertTo-Json), [Text.Encoding]::UTF8)
+Run-Quiet 'Registering active installation' $VenvPython @((Join-Path $AppDir 'app\installation.py'),'--register',$AppDir,$VenvPython,$CmdPath)
 
 Write-Host ''
 Write-Host '========================================' -ForegroundColor DarkYellow

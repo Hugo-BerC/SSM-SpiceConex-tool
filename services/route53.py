@@ -5,9 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import boto3
-from botocore.config import Config
 
-from app.config import AWS_TIMEOUT_SECONDS
+from aws.session import client_config as _client_config, get_boto3_session
 from utils.logging import get_logger
 
 
@@ -25,14 +24,6 @@ ROUTE53_RECORD_COLUMNS = [
 ]
 
 
-def _client_config() -> Config:
-    timeout = max(5, AWS_TIMEOUT_SECONDS)
-    return Config(
-        connect_timeout=min(5, timeout),
-        read_timeout=timeout,
-        retries={"mode": "standard", "max_attempts": 1},
-        tcp_keepalive=True,
-    )
 
 
 def _zone_id(value: Any) -> str:
@@ -54,7 +45,7 @@ def discover_private_hosted_zones(profile: str, region: str) -> dict:
     if not region:
         raise ValueError("No AWS region is selected in Terminal.")
 
-    session = boto3.Session(profile_name=profile, region_name=region)
+    session = get_boto3_session(profile, region)
     route53 = session.client("route53", config=_client_config())
     zones: list[dict] = []
     paginator = route53.get_paginator("list_hosted_zones")
@@ -129,7 +120,7 @@ def discover_hosted_zone_records(profile: str, region: str, hosted_zone_id: str)
     if not hosted_zone_id:
         raise ValueError("No private hosted zone is selected.")
 
-    session = boto3.Session(profile_name=profile, region_name=region)
+    session = get_boto3_session(profile, region)
     route53 = session.client("route53", config=_client_config())
     records: list[dict] = []
     paginator = route53.get_paginator("list_resource_record_sets")

@@ -6,7 +6,7 @@ import json
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from PySide6.QtCore import QObject, QPointF, QThread, QTimeZone, QDateTime, Qt, Signal, Slot, QUrl
+from PySide6.QtCore import QPointF, QTimeZone, QDateTime, Qt, Slot, QUrl
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDateTimeEdit, QFileDialog, QFrame,
@@ -18,22 +18,7 @@ from PySide6.QtWidgets import (
 from services.dr_dashboard import ComparisonPair, TEMPLATES, artifact_prefix, build_dashboard, build_pair_metrics, dashboard_name_for_profile, format_metric_value, metric_dimensions, publish_new_dashboard, query_metrics, render_html_report, report_metric_key, resource_metric_dimensions, supports_metric_resource
 from utils.csv_safety import csv_safe_value
 from app.config import AWS_REGIONS
-
-
-class _Worker(QObject):
-    finished = Signal(object)
-    failed = Signal(object)
-
-    def __init__(self, operation):
-        super().__init__()
-        self.operation = operation
-
-    @Slot()
-    def run(self):
-        try:
-            self.finished.emit(self.operation())
-        except Exception as exc:
-            self.failed.emit(exc)
+from pyside6_poc.tasks import start_task, task_busy
 
 
 class MetricPreview(QGraphicsView):
@@ -513,22 +498,14 @@ class DRDashboardPage(QWidget):
                 if (item := self.resources.item(row, 0)) and item.checkState() == Qt.CheckState.Checked]
 
     def _run_worker(self, operation, finished):
-        if self.thread is not None:
+        if task_busy(self):
             return
         self.prepare_button.setEnabled(False); self.publish.setEnabled(False)
-        thread = QThread(self); worker = _Worker(operation); self.thread = thread; self.worker = worker
-        worker.moveToThread(thread); thread.started.connect(worker.run)
-        worker.finished.connect(finished); worker.failed.connect(self._failed)
-        worker.finished.connect(thread.quit); worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater); worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(self._cleanup); thread.start()
+        start_task(self, operation, finished, self._failed, self._cleanup,
+                   context=lambda: (self.context_key, self._profile_current(), self._revision))
 
     @Slot()
     def _cleanup(self):
-        thread = self.thread
-        self.thread = None; self.worker = None
-        if thread:
-            thread.deleteLater()
         self.prepare_button.setEnabled(True)
         self.publish.setEnabled(bool(self.prepared) and not self.demo)
 
@@ -538,6 +515,7 @@ class DRDashboardPage(QWidget):
         self.show_error(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
     def prepare(self):
+        if task_busy(self): return
         if not self.graph:
             QMessageBox.warning(self, "DR dashboard", "Discover infrastructure first."); return
         profile = self._profile_current()
@@ -652,6 +630,7 @@ class DRDashboardPage(QWidget):
             if not image.save(path): self.show_error(RuntimeError("Unable to save the preview image."))
 
     def publish_dashboard(self):
+        if task_busy(self): return
         if not self.prepared or self.demo: return
         data = self.prepared
         if data["profile"] != self._profile_current() or data["context"] != self.context_key:

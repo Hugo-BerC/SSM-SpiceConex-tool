@@ -8,3 +8,6 @@ SpiceConex does not require AWS account IDs, organization names, instance IDs, p
 - Account identity is not written back to the repository or generated configuration files.
 - Demo data uses documentation-only IP space (`192.0.2.0/24`) and synthetic instance IDs.
 - Never commit `~/.aws`, credentials, SSO cache files, `.env` files, generated logs or exported infrastructure data.
+- Application logs redact known credential/token fields, authorization URLs and authentication headers, including formatted exception tracebacks. The log viewer sanitizes older content as well. Redaction is not a substitute for avoiding secret-bearing messages and reviewing diagnostics before sharing them.
+- Logs retain bounded history across sessions (current 2 MiB file plus up to five backups). Use `SSM_SPICECONEX_LOG_DIR` to choose a protected local location; infrastructure identifiers may still be present.
+- Local regression tests use mocks/stubs and offscreen Qt. `python -B tools/run_tests.py` isolates log files and blocks Python socket connections and UI icon downloads; it does not authorize live AWS changes.

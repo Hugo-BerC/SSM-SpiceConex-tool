@@ -2,8 +2,6 @@
 set -eu
 
 APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-RUNTIME_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/SSM-SpiceConex"
-ACTIVE_INSTALL_FILE="$RUNTIME_ROOT/active-installation.json"
 MIN_PY_MAJOR=3
 MIN_PY_MINOR=10
 PLUGIN_MIN_VERSION="1.2.764.0"
@@ -12,6 +10,7 @@ trap 'rm -rf "$TMP_SETUP"' EXIT
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+[ ! -e "$APP_DIR/.spiceconex-update.lock" ] || fail "An update/recovery lock exists. Review its journal before running setup."
 
 # Run a noisy command in the background and show only a compact spinner.
 # stdout/stderr are kept in a temporary log and shown only if the step fails.
@@ -38,7 +37,7 @@ run_quiet() {
     return 1
 }
 
-version_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' >/dev/null 2>&1; }
+version_ok() { "$1" -c 'import sys,struct; raise SystemExit(0 if sys.version_info >= (3,10) and struct.calcsize("P")==8 else 1)' >/dev/null 2>&1; }
 find_python() { for candidate in python3 python; do if command -v "$candidate" >/dev/null 2>&1 && version_ok "$candidate"; then command -v "$candidate"; return 0; fi; done; return 1; }
 run_as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; elif command -v sudo >/dev/null 2>&1; then sudo "$@"; else fail "This step needs administrator privileges. Run as root or install sudo."; fi; }
 
@@ -46,6 +45,13 @@ OS_KIND=""
 if [ "$(uname -s)" = "Darwin" ]; then OS_KIND="macOS"
 elif [ "$(uname -s)" = "Linux" ]; then if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then OS_KIND="WSL"; else OS_KIND="Linux"; fi
 else fail "Unsupported shell/OS: $(uname -s). On native Windows run setup.ps1 instead."; fi
+
+MACHINE=$(uname -m)
+case "$MACHINE" in
+    x86_64|amd64) AWS_ARCH="x86_64" ;;
+    aarch64|arm64) AWS_ARCH="aarch64" ;;
+    *) fail "Unsupported architecture: $MACHINE. A 64-bit x86 or ARM workstation is required." ;;
+esac
 
 printf '\n'
 printf '    ███████╗██████╗ ██╗ ██████╗███████╗\n'
@@ -72,6 +78,12 @@ fi
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
     say "Administrator privileges are required for system components."
     sudo -v
+fi
+
+if ! command -v curl >/dev/null 2>&1; then
+    [ -f /etc/debian_version ] || fail "Install curl before running setup."
+    run_quiet 'Installing download prerequisites' run_as_root apt-get update
+    run_quiet 'Installing download prerequisites' run_as_root apt-get install -y curl ca-certificates
 fi
 
 if { [ "$OS_KIND" = "Linux" ] || [ "$OS_KIND" = "WSL" ]; } && command -v xterm >/dev/null 2>&1 && [ -f /etc/debian_version ] && ! dpkg-query -W -f='${Status}' xfonts-base 2>/dev/null | grep -q 'install ok installed'; then
@@ -150,10 +162,19 @@ if aws_cli_v2_ok; then say "AWS CLI v2 detected: $(aws --version 2>&1)"
 else
     say "AWS CLI v2 not found. Installing the official AWS CLI v2..."
     case "$OS_KIND" in
-        macOS|Linux|WSL)
-            curl -fsSL https://awscli.amazonaws.com/v2/install.sh -o "$TMP_SETUP/aws-install.sh"
-            chmod +x "$TMP_SETUP/aws-install.sh"
-            run_quiet 'Installing AWS CLI v2' run_as_root "$TMP_SETUP/aws-install.sh" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin
+        macOS)
+            curl -fsSL https://awscli.amazonaws.com/AWSCLIV2.pkg -o "$TMP_SETUP/AWSCLIV2.pkg"
+            run_quiet 'Installing AWS CLI v2' run_as_root installer -pkg "$TMP_SETUP/AWSCLIV2.pkg" -target /
+            ;;
+        Linux|WSL)
+            if ! command -v unzip >/dev/null 2>&1; then
+                [ -f /etc/debian_version ] || fail "Install unzip before running setup."
+                run_quiet 'Installing unzip' run_as_root apt-get update
+                run_quiet 'Installing unzip' run_as_root apt-get install -y unzip
+            fi
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$AWS_ARCH.zip" -o "$TMP_SETUP/awscliv2.zip"
+            run_quiet 'Extracting AWS CLI v2' unzip -q "$TMP_SETUP/awscliv2.zip" -d "$TMP_SETUP"
+            run_quiet 'Installing AWS CLI v2' run_as_root "$TMP_SETUP/aws/install" --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin --update
             ;;
     esac
     aws_cli_v2_ok || fail "AWS CLI v2 could not be installed or located in PATH."
@@ -196,35 +217,22 @@ run_quiet 'Creating Python virtual environment' "$PYTHON_BIN" -m venv "$APP_DIR/
 VENV_PY="$APP_DIR/.venv/bin/python"
 run_quiet 'Installing Python package manager' "$VENV_PY" -m pip install --upgrade pip --disable-pip-version-check --no-input
 run_quiet 'Installing SpiceConex Python modules' "$VENV_PY" -m pip install -r "$APP_DIR/requirements.txt" --disable-pip-version-check --no-input
+run_quiet 'Checking Python dependency compatibility' "$VENV_PY" -m pip check
+run_quiet 'Checking application imports' "$VENV_PY" "$APP_DIR/app/installation.py" --check "$APP_DIR"
 
-cat > "$APP_DIR/spiceconex" <<EOF2
-#!/bin/sh
-exec "$VENV_PY" "$APP_DIR/ssm_spiceconex.py" "\$@"
-EOF2
+"$VENV_PY" - "$APP_DIR" "$VENV_PY" <<'PY'
+import shlex, sys
+from pathlib import Path
+app_dir, python = Path(sys.argv[1]), sys.argv[2]
+command = shlex.join([python, str(app_dir / "ssm_spiceconex.py")])
+(app_dir / "spiceconex").write_text('#!/bin/sh\nexec ' + command + ' "$@"\n', encoding='utf-8')
+PY
 chmod +x "$APP_DIR/spiceconex"
 PREFIX="/usr/local/bin"
 run_as_root mkdir -p "$PREFIX"
 run_as_root cp "$APP_DIR/spiceconex" "$PREFIX/spiceconex"
 run_as_root chmod 755 "$PREFIX/spiceconex"
-mkdir -p "$RUNTIME_ROOT"
-"$VENV_PY" - "$ACTIVE_INSTALL_FILE" "$APP_DIR" "$VENV_PY" "$PREFIX/spiceconex" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-manifest, app_dir, python, launcher = map(Path, sys.argv[1:])
-payload = {
-    "schema": 1,
-    "app_dir": str(app_dir),
-    "python": str(python),
-    "launcher": str(launcher),
-    "installed_at_utc": datetime.now(timezone.utc).isoformat(),
-}
-temporary = manifest.with_suffix(".tmp")
-temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-temporary.replace(manifest)
-PY
+run_quiet 'Registering active installation' "$VENV_PY" "$APP_DIR/app/installation.py" --register "$APP_DIR" "$VENV_PY" "$PREFIX/spiceconex"
 
 printf '\n========================================\n'
 printf ' SPICECONEX READY\n'

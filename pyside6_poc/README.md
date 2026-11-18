@@ -11,6 +11,12 @@ python -m pyside6_poc.main --demo
 
 The demo uses no AWS calls and renders sample instances.
 
+The directory also contains the production PySide6 UI. `main.py` assembles it;
+`startup.py`, `theme.py`, `base_page.py`, `dialogs.py`, `performance_page.py` and
+`tasks.py` hold the extracted startup, presentation and coordination components.
+Optional artwork is not required for startup. Runtime requirements and validation
+instructions are maintained in the root [README](../README.md).
+
 ## Design direction
 
 - dark mineral surfaces rather than brown panels

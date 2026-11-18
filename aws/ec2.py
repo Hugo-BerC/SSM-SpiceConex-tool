@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from aws.session import get_ec2_client, get_ssm_client
+from aws.auth import is_session_unavailable
 from models.instance import EC2Instance
 from utils.logging import get_logger
 
@@ -20,6 +21,8 @@ def _ssm_information_by_instance(profile: str, region: str) -> tuple[dict[str, d
         logger.info("SSM managed instance inventory completed | instances=%d", len(information))
         return information, True
     except Exception as exc:
+        if is_session_unavailable(exc):
+            raise
         # Some read-only roles deliberately grant EC2 visibility but not SSM
         # inventory. Do not hide the fleet or make the user change role here.
         logger.warning("SSM managed instance inventory unavailable | %s", exc)

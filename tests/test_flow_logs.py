@@ -160,3 +160,17 @@ class FlowLogTests(unittest.TestCase):
     def test_direction_handles_private_to_private_paths(self):
         networks = [ipaddress.ip_network("10.0.0.0/16")]
         self.assertEqual("INTERNAL", _direction("10.0.1.2", "10.0.2.3", networks))
+
+    def test_normalised_query_aliases_preserve_accept_and_reject(self):
+        for prefix in ("", "flow_"):
+            for action in ("ACCEPT", "REJECT"):
+                with self.subTest(prefix=prefix, action=action):
+                    fields = {prefix + key: value for key, value in {
+                        "srcaddr": "192.0.2.1", "dstaddr": "192.0.2.2", "srcport": "443",
+                        "dstport": "49152", "protocol": "6", "action": action,
+                    }.items()}
+                    fields.update(observations="3", total_bytes="128")
+                    data = [[{"field": key, "value": value} for key, value in fields.items()]]
+                    rows, observations = _rows(data, [], ["192.0.2.1"], normalise_ports=True)
+                    self.assertEqual(action, rows[0]["Result"])
+                    self.assertEqual(3, observations)

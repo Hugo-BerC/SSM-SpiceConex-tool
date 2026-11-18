@@ -2,31 +2,46 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+import uuid
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from utils.paths import log_dir
+from utils.redaction import redact_sensitive
 
 LOGGER_NAME = "ssm_spiceconex"
 LOG_FILENAME = "ssm-spiceconex.log"
 
 
+@lru_cache(maxsize=1)
 def _fallback_log_dir() -> Path:
-    path = Path.cwd() / "logs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return Path(tempfile.mkdtemp(prefix="spiceconex-logs-"))
 
 
 def _resolve_log_dir() -> Path:
     override = os.environ.get("SSM_SPICECONEX_LOG_DIR", "").strip()
     if override:
         path = Path(override).expanduser()
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            pass
     try:
         return log_dir()
     except (OSError, PermissionError):
-        return _fallback_log_dir()
+        try:
+            return _fallback_log_dir()
+        except OSError:
+            return Path(tempfile.gettempdir()) / "SSM-SpiceConex" / "logs"
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        # Redact the fully formatted traceback too, not just record.msg/args.
+        return redact_sensitive(super().format(record))
 
 
 def configure_logging() -> logging.Logger:
@@ -37,43 +52,33 @@ def configure_logging() -> logging.Logger:
     directory = _resolve_log_dir()
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    handler = RotatingFileHandler(
-        directory / LOG_FILENAME,
-        maxBytes=2 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-        delay=False,
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"))
+    try:
+        handler = RotatingFileHandler(
+            directory / LOG_FILENAME, maxBytes=2 * 1024 * 1024,
+            backupCount=5, encoding="utf-8", delay=False,
+        )
+    except OSError:
+        handler = logging.StreamHandler()
+    handler.setFormatter(RedactingFormatter("%(asctime)s | %(levelname)-8s | %(name)s | pid=%(process)d | %(threadName)s | %(message)s"))
     logger.addHandler(handler)
     logger.info("Logging initialized | log_file=%s", directory / LOG_FILENAME)
     return logger
 
 
 def reset_logging_session() -> logging.Logger:
-    """Begin a new application-session log without keeping stale entries.
-
-    Module imports initialise logging before the Qt entry point runs, so the
-    reset deliberately lives here and is called once from ``main``.  Closing
-    handlers first is essential on Windows, where an open handler prevents the
-    active file from being replaced or deleted.
-    """
+    """Mark a new session while retaining bounded history for diagnostics."""
     logger = logging.getLogger(LOGGER_NAME)
     for handler in list(logger.handlers):
-        handler.flush()
-        handler.close()
+        try:
+            handler.flush()
+            handler.close()
+        except (OSError, ValueError):
+            pass
         logger.removeHandler(handler)
 
-    directory = _resolve_log_dir()
-    try:
-        for previous_log in directory.glob(f"{LOG_FILENAME}*"):
-            if previous_log.is_file():
-                previous_log.unlink()
-    except OSError:
-        # Logging must never prevent SpiceConex from starting.  The fresh
-        # active log will still be created below when the directory allows it.
-        pass
-    return configure_logging()
+    logger = configure_logging()
+    logger.info("Application session started | session=%s", uuid.uuid4().hex[:12])
+    return logger
 
 
 def get_logger(name: str | None = None) -> logging.Logger:

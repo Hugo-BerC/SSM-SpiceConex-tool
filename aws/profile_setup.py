@@ -15,9 +15,8 @@ from datetime import datetime
 from pathlib import Path
 
 import boto3
-from botocore.config import Config
 
-from app.config import AWS_TIMEOUT_SECONDS
+from aws.session import client_config as _client_config, get_boto3_session
 
 
 @dataclass(frozen=True)
@@ -46,9 +45,6 @@ def aws_paths() -> tuple[Path, Path]:
     return config_path, credentials_path
 
 
-def _client_config() -> Config:
-    timeout = max(5, AWS_TIMEOUT_SECONDS)
-    return Config(connect_timeout=min(5, timeout), read_timeout=timeout, retries={"mode": "standard", "max_attempts": 1})
 
 
 def _validate_request(request: ProfileSetupRequest) -> None:

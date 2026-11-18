@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 import csv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot, QPointF, QUrl, QDateTime, QTimeZone
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QImage, QLinearGradient, QRadialGradient, QKeySequence, QAction, QDesktopServices, QIcon, QPolygonF, QPen, QPainterPath
@@ -24,6 +22,7 @@ from app.config import APP_VERSION
 from app.updater import check_for_update, launch_update_process
 from aws.identity import get_caller_identity
 from aws.sso import login_profile
+from aws.auth import is_session_unavailable as _session_unavailable, sso_login_profile
 from aws.session import clear_session_cache
 from aws.profiles import discover_profiles
 from aws.profile_setup import ProfileSetupRequest, bootstrap_sso_profiles
@@ -31,8 +30,6 @@ from models.instance import EC2Instance
 from terminal.platform import open_command
 from services.ssm_commands import build_port_forward_command, build_start_session_command, validate_port
 from services.ssm import send_command
-from services.ebs import list_instance_volumes, create_cloudwatch_dashboard
-from services.performance import calculate_baseline
 from services.connectivity import parse_connectivity_csv, validate_connectivity_csv
 from services.flow_logs import analyse_flow_log, discover_vpc_flow_inventory
 from services.certificates import (
@@ -46,90 +43,22 @@ from services.cloudfront import CLOUDFRONT_COLUMNS, discover_distributions
 from services.discovery.engine import DEFAULT_TAG_KEY, SUPPORTED_TAG_KEYS, discover_infrastructure
 from services.discovery.models import InfrastructureGraph, ResourceNode
 from pyside6_poc.dr_dashboard import DRDashboardPage
-from utils.logging import get_logger, log_path, log_directory, reset_logging_session
+from pyside6_poc.tasks import AwsContext, Worker, start_task, task_busy
+from pyside6_poc.global_inventory import GlobalInventoryPage
+from utils.logging import get_logger, log_path, log_directory
 from utils.csv_safety import csv_safe_value
+from utils.redaction import redact_sensitive
+from aws.operations import run_with_sso
+from pyside6_poc.base_page import BasePage, DuneBackdrop
+from pyside6_poc.dialogs import _exception_summary, show_dialog, show_exception, confirm_operation, _open_csv_dialog
+from pyside6_poc.performance_page import PerformancePage
+from pyside6_poc.theme import (
+    ROOT, SKIN, TEXTURE, LOGO_SIDEBAR, LOGO_MAIN, VOID, BASALT, SURFACE, SURFACE_2,
+    LINE, TEXT, MUTED, SAND, SPICE, MELANGE, MELANGE_GLOW, GREEN, RED, STYLE,
+)
 from app.config import AWS_REGIONS, DEFAULT_REGION
 
 logger = get_logger("ui")
-
-ROOT = Path(__file__).resolve().parent
-SKIN = ROOT.parent / "skin_spiceconex.jpg"
-TEXTURE = ROOT / "dune_topography.png"
-LOGO_SIDEBAR = ROOT / "spiceconex_logo_sidebar.png"
-LOGO_MAIN = ROOT / "spiceconex_logo_main.png"
-
-VOID = "#080a0b"
-BASALT = "#0d1112"
-SURFACE = "#121718"
-SURFACE_2 = "#171d1e"
-LINE = "#29302f"
-TEXT = "#eee9df"
-MUTED = "#858a86"
-SAND = "#c7a56a"
-SPICE = "#d3914d"
-MELANGE = "#b96836"
-MELANGE_GLOW = "#d47a3f"
-GREEN = "#7ea67a"
-RED = "#c56f60"
-
-
-# ---------------------------------------------------------------------------
-# User-facing dialogs
-# ---------------------------------------------------------------------------
-# Keep the visible message useful to an operator while retaining the raw
-# exception in the expandable details section. This is preferable to showing
-# a bare Python/boto3 exception as the only message.
-def _exception_summary(context: str, exc: Exception) -> tuple[str, str]:
-    message = str(exc).strip() or exc.__class__.__name__
-    text = message.lower()
-
-    if "profile" in text and ("not found" in text or "could not be found" in text):
-        summary = f"The AWS profile required for {context} could not be found."
-        action = "Check the selected profile and run 'aws configure list-profiles' if necessary."
-    elif "unable to locate credentials" in text or "no credentials" in text:
-        summary = f"No AWS credentials are available to perform {context}."
-        action = "Authenticate with AWS SSO or configure the selected AWS credential source, then try again."
-    elif "expiredtoken" in text or "expired token" in text:
-        summary = f"The AWS session used for {context} has expired."
-        action = "Refresh the AWS SSO session and try again."
-    elif "accessdenied" in text or "access denied" in text or "not authorized" in text:
-        summary = f"AWS denied the permissions required for {context}."
-        action = "Check the IAM policy/role used by the selected profile and confirm it allows the requested AWS API operation."
-    elif "could not connect" in text or "endpoint connection" in text or "connection timeout" in text:
-        summary = f"AWS could not be reached while attempting {context}."
-        action = "Check network connectivity, proxy settings and the selected AWS region."
-    elif "validation" in context.lower():
-        summary = "The AWS session could not be validated."
-        action = "Check the selected profile, region and active AWS/SSO session, then try again."
-    else:
-        summary = f"{context} could not be completed."
-        action = "Review the details below and verify the selected AWS context before retrying."
-
-    return summary, f"{action}\n\nTechnical details:\n{message}"
-
-
-def show_dialog(parent, level: QMessageBox.Icon, title: str, summary: str,
-                details: str | None = None) -> None:
-    box = QMessageBox(level, title, summary, QMessageBox.StandardButton.Ok, parent)
-    if details:
-        box.setDetailedText(details)
-    box.exec()
-
-
-def show_exception(parent, title: str, context: str, exc: Exception,
-                   level: QMessageBox.Icon = QMessageBox.Icon.Critical) -> None:
-    summary, details = _exception_summary(context, exc)
-    show_dialog(parent, level, title, summary, details)
-
-
-def confirm_operation(parent, title: str, summary: str, details: str = "") -> bool:
-    """Require a deliberate operator decision before an AWS write operation."""
-    box = QMessageBox(QMessageBox.Icon.Warning, title, summary, parent=parent)
-    box.setInformativeText(details)
-    box.setStandardButtons(QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes)
-    box.setDefaultButton(QMessageBox.StandardButton.Cancel)
-    return box.exec() == QMessageBox.StandardButton.Yes
-
 
 def shadow(widget, blur=28, y=8, alpha=75):
     effect = QGraphicsDropShadowEffect(widget)
@@ -137,57 +66,6 @@ def shadow(widget, blur=28, y=8, alpha=75):
     effect.setOffset(0, y)
     effect.setColor(QColor(0, 0, 0, alpha))
     widget.setGraphicsEffect(effect)
-
-
-def _open_csv_dialog(parent, title: str) -> str:
-    """Open the Qt widget-based CSV picker so it follows the SpiceConex theme."""
-    dialog = QFileDialog(parent, title, str(Path.home()), "CSV files (*.csv);;All files (*)")
-    # The native picker is outside our stylesheet. Force the Qt widget dialog
-    # so the file browser uses the same Arrakis/SpiceConex visual system.
-    dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-    dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-    dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
-    dialog.resize(900, 600)
-    if dialog.exec() == QDialog.DialogCode.Accepted:
-        files = dialog.selectedFiles()
-        return files[0] if files else ""
-    return ""
-
-
-class DuneBackdrop(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.texture = QPixmap(str(TEXTURE)) if TEXTURE.exists() else QPixmap()
-        self.skin = QPixmap(str(SKIN)) if SKIN.exists() else QPixmap()
-        # Pages can tune their atmosphere without changing the shared artwork.
-        self.texture_opacity = 0.14
-        self.skin_opacity = 0.13
-        self.shade_opacity = (58, 28, 18)
-        self.setObjectName("backdrop")
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.fillRect(self.rect(), QColor(VOID))
-        if not self.texture.isNull():
-            texture = self.texture.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.setOpacity(self.texture_opacity)
-            painter.drawPixmap((self.width() - texture.width()) // 2, (self.height() - texture.height()) // 2, texture)
-        if not self.skin.isNull():
-            skin = self.skin.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.setOpacity(self.skin_opacity)
-            painter.drawPixmap((self.width() - skin.width()) // 2, (self.height() - skin.height()) // 2, skin)
-        glow = QRadialGradient(self.width() * 0.82, self.height() * 0.78, max(self.width(), self.height()) * 0.42)
-        glow.setColorAt(0.0, QColor(211, 145, 77, 28))
-        glow.setColorAt(1.0, QColor(211, 145, 77, 0))
-        painter.setOpacity(1.0)
-        painter.fillRect(self.rect(), glow)
-        gradient = QLinearGradient(0, 0, self.width(), 0)
-        gradient.setColorAt(0.0, QColor(0, 0, 0, self.shade_opacity[0]))
-        gradient.setColorAt(0.55, QColor(0, 0, 0, self.shade_opacity[1]))
-        gradient.setColorAt(1.0, QColor(0, 0, 0, self.shade_opacity[2]))
-        painter.fillRect(self.rect(), gradient)
-        painter.end()
 
 
 class Sidebar(QFrame):
@@ -292,6 +170,7 @@ class Sidebar(QFrame):
 
 class AwsConnectionRail(QFrame):
     """The single visual entry point for selecting and connecting AWS context."""
+    contextRefreshed = Signal()
     def __init__(self):
         super().__init__(); self.setObjectName("commandRail")
         layout = QHBoxLayout(self); layout.setContentsMargins(22, 18, 22, 18); layout.setSpacing(10)
@@ -407,23 +286,6 @@ class FleetPanel(QFrame):
             row.setHidden(not matches)
 
 
-class Worker(QObject):
-    finished = Signal(object); failed = Signal(object)
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-    @Slot()
-    def run(self):
-        try:
-            logger.info("Worker started")
-            result = self.fn()
-            logger.info("Worker completed")
-            self.finished.emit(result)
-        except Exception as exc:
-            logger.exception("Worker failed")
-            self.failed.emit(exc)
-
-
 def _save_csv_dialog(parent, title: str, default_name: str) -> str:
     dialog = QFileDialog(parent, title, str(Path.home() / default_name), "CSV files (*.csv);;All files (*)")
     dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
@@ -470,38 +332,10 @@ def demo_instances():
     ]
 
 
-class BasePage(DuneBackdrop):
-    def page_header(self, eyebrow, title, subtitle, status="◆  READY"):
-        root = self.layout = QVBoxLayout(self); root.setContentsMargins(34, 28, 34, 22); root.setSpacing(16)
-        header = QHBoxLayout(); box = QVBoxLayout(); box.setSpacing(2)
-        for text, obj in [(eyebrow, "pageEyebrow"), (title, "pageTitle"), (subtitle, "pageSubtitle")]:
-            label = QLabel(text); label.setObjectName(obj); box.addWidget(label)
-        header.addLayout(box); header.addStretch(); self.status = QLabel(status); self.status.setObjectName("topStatus"); header.addWidget(self.status, 0, Qt.AlignmentFlag.AlignTop); root.addLayout(header)
-        return root
-
-
-def _session_unavailable(exc: Exception) -> bool:
-    text = str(exc).lower()
-    markers = (
-        "expiredtoken", "expired token", "unauthorizedsso",
-        "sso session", "token has expired", "unable to locate credentials",
-        "no credentials", "credential should be refreshed", "invalidclienttokenid", "unrecognizedclientexception",
-        "the security token included in the request is invalid", "security token is invalid",
-    )
-    return any(marker in text for marker in markers)
-
-
 def _run_with_sso(profile: str, operation):
-    """Run an AWS operation, refreshing an unavailable SSO session once."""
-    try:
-        return operation()
-    except Exception as exc:
-        if not _session_unavailable(exc):
-            raise
-        logger.warning("AWS session unavailable | profile=%r | starting SSO login", profile)
-        login_profile(profile)
-        clear_session_cache()
-        return operation()
+    # Compatibility adapter for existing callers and patchable credential hooks.
+    return run_with_sso(profile, operation, login=login_profile,
+                        resolve=sso_login_profile, clear=clear_session_cache)
 
 
 def _discover_certificates_for_profiles(profiles: list[str], region: str) -> dict:
@@ -541,6 +375,8 @@ def _discover_certificates_for_profiles(profiles: list[str], region: str) -> dic
         "certificates": certificates,
         "balancers": balancers,
         "region": region,
+        "warnings": [f"{item.get('profile', '')}: {warning}" for item in inventories
+                     for warning in item.get("warnings", [])],
     }
 
 
@@ -646,7 +482,7 @@ class HomePage(DuneBackdrop):
         self.context=QLabel("Select an AWS profile and region, then connect to load the EC2 fleet."); self.context.setObjectName("homeContext"); self.context.setAlignment(Qt.AlignmentFlag.AlignCenter); root.addWidget(self.context)
         root.addStretch(1)
         self.commands.configure_profiles.clicked.connect(self.configure_profiles); self.commands.refresh_profiles.clicked.connect(self.load_profiles); self.commands.validate.clicked.connect(self.validate_profile); self.commands.connect.clicked.connect(self.connect_aws)
-        self.commands.region.currentTextChanged.connect(self._context_changed); self.commands.profile.currentTextChanged.connect(self._context_changed)
+        self.aws_context = AwsContext(self, self.commands, self._context_changed)
         self.load_profiles()
 
     def set_terminal(self, terminal): self.terminal=terminal
@@ -655,7 +491,6 @@ class HomePage(DuneBackdrop):
         self.sidebar.set_profile(profile, region)
         self.sidebar.set_connection_state("context", "◆  AWS CONTEXT CHANGED")
         self.context.setText("AWS context changed. Connect to AWS when you are ready to load the EC2 fleet.")
-        if self.terminal and not self.demo: self.terminal.context_changed()
     def load_profiles(self):
         logger.info("Loading AWS profiles for Home")
         try:
@@ -663,14 +498,16 @@ class HomePage(DuneBackdrop):
             self.commands.profile.blockSignals(True); self.commands.profile.clear(); self.commands.profile.addItems(profiles); self.commands.profile.blockSignals(False)
             completer=QCompleter(self.commands.profile.model(),self.commands.profile); completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive); completer.setFilterMode(Qt.MatchFlag.MatchContains); completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion); self.commands.profile.setCompleter(completer)
             if profiles: self.commands.profile.setCurrentText(selected if selected in profiles else profiles[0])
-            self._context_changed()
+            self.commands.contextRefreshed.emit()
             self.context.setText(f"{len(profiles)} local AWS profile(s) available. Select one and connect.")
         except Exception as exc:
             logger.exception("Failed to discover AWS profiles"); show_exception(self,"AWS profiles","loading the available AWS profiles",exc)
     def _set_connecting(self, connecting):
+        connecting = connecting or task_busy(self) or bool(self.terminal and task_busy(self.terminal))
         self.commands.connect.setEnabled(not connecting); self.commands.validate.setEnabled(not connecting); self.commands.configure_profiles.setEnabled(not connecting); self.commands.refresh_profiles.setEnabled(not connecting)
     def connect_aws(self):
         if not self.terminal: return
+        if task_busy(self) or task_busy(self.terminal): return
         profile=self.commands.profile.currentText().strip()
         if not profile:
             show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","No AWS profile is selected.","Select an AWS profile before continuing."); return
@@ -680,11 +517,15 @@ class HomePage(DuneBackdrop):
     def fleet_failed(self):
         self._set_connecting(False); self.sidebar.set_connection_state("error", "◆  AWS CONNECTION ERROR"); self.context.setText("The AWS connection could not load the EC2 fleet. Review the error and retry.")
     def configure_profiles(self):
+        if task_busy(self) or (self.terminal and task_busy(self.terminal)): return
         if self.demo:
             show_dialog(self,QMessageBox.Icon.Information,"AWS profile setup","Profile configuration is unavailable in demo mode."); return
         dialog=AWSProfileSetupDialog(self,self.commands.region.currentText().strip() or DEFAULT_REGION)
         if dialog.exec()!=QDialog.DialogCode.Accepted: return
-        self._set_connecting(True); self.context.setText("Configuring AWS profiles…"); self.thread=QThread(); self.worker=Worker(lambda:bootstrap_sso_profiles(dialog.request())); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self.profiles_configured); self.worker.failed.connect(self.profile_setup_failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        request = dialog.request()
+        self._set_connecting(True); self.context.setText("Configuring AWS profiles…")
+        start_task(self, lambda: bootstrap_sso_profiles(request), self.profiles_configured,
+                   self.profile_setup_failed, self.cleanup)
     @Slot(object)
     def profiles_configured(self,result):
         profiles=result.get("profiles",[]); self.load_profiles()
@@ -696,6 +537,7 @@ class HomePage(DuneBackdrop):
         self._set_connecting(False); self.context.setText("AWS profile setup failed. Review the details and retry.")
         show_exception(self,"AWS profile setup failed","validating credentials and generating AWS SSO profiles",exc if isinstance(exc,Exception) else RuntimeError(str(exc)))
     def validate_profile(self):
+        if task_busy(self) or (self.terminal and task_busy(self.terminal)): return
         profile=self.commands.profile.currentText().strip(); region=self.commands.region.currentText().strip() or DEFAULT_REGION
         if not profile:
             show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","No AWS profile is selected.","Select an AWS profile before continuing."); return
@@ -703,8 +545,8 @@ class HomePage(DuneBackdrop):
             show_dialog(self,QMessageBox.Icon.Information,"AWS validation","Demo mode is active; no AWS STS request was made."); return
         self._set_connecting(True)
         self.context.setText("Validating the AWS session…")
-        self.thread=QThread(); self.worker=Worker(lambda: _run_with_sso(profile,lambda:get_caller_identity(profile,region))); self.worker.moveToThread(self.thread); worker=self.worker
-        self.thread.started.connect(worker.run); worker.finished.connect(self.validation_succeeded); worker.failed.connect(self.validation_failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        start_task(self, lambda: _run_with_sso(profile, lambda: get_caller_identity(profile, region)),
+                   self.validation_succeeded, self.validation_failed, self.cleanup)
     @Slot(object)
     def validation_succeeded(self, identity):
         account=identity.get("Account","unknown"); masked=f"••••{account[-4:]}" if account!="unknown" else "unknown"; region=self.commands.region.currentText().strip() or DEFAULT_REGION
@@ -716,8 +558,7 @@ class HomePage(DuneBackdrop):
     def validation_failed(self, exc):
         self._set_connecting(False); self.context.setText("AWS validation failed. Review the error and retry."); show_exception(self,"AWS validation failed","validating the selected AWS session",exc if isinstance(exc,Exception) else RuntimeError(str(exc)))
     def cleanup(self):
-        if self.thread: self.thread.deleteLater(); self.thread=None
-        self.worker=None
+        self._set_connecting(bool(self.terminal and task_busy(self.terminal)))
 
 
 class PowerCon(BasePage):
@@ -736,23 +577,28 @@ class PowerCon(BasePage):
     def _context_label(self, *_):
         profile=self.commands.profile.currentText().strip() or "No profile selected"; region=self.commands.region.currentText().strip() or DEFAULT_REGION; self.active_context.setText(f"{profile}  ·  {region}"); self.metrics.set_value("region",region)
     def context_changed(self):
+        if self.demo:
+            self._context_label()
+            return
         self._context_label(); self.set_instances([]); self.open_sessions.setEnabled(False); self.status.setText("◆  CONTEXT CHANGED — CONNECT FROM HOME")
     def _selection_changed(self, count):
         self.metrics.set_value("selected", count)
-        self.open_sessions.setEnabled(bool(count))
+        self.open_sessions.setEnabled(bool(count) and not task_busy(self))
         self.open_sessions.setToolTip("Open one terminal per selected instance." if count else "Select one or more SSM-ready instances first.")
     def set_instances(self,instances):
         logger.info("Updating fleet UI | instances=%d",len(instances)); self.instances=list(instances); self.fleet._filter_query=self.search.text(); self.fleet.set_instances(self.instances); self.instancesChanged.emit(self.instances); self.metrics.set_value("instances",len(self.instances)); self.metrics.set_value("managed",sum(i.session_ready for i in self.instances))
     def load(self):
+        if task_busy(self): return
         profile=self.commands.profile.currentText().strip()
         if not profile:
             show_dialog(self, QMessageBox.Icon.Warning, "AWS profile", "No AWS profile is selected.", "Select an AWS profile before continuing.")
             return
         region=self.commands.region.currentText().strip()
         logger.info("Starting EC2 fleet load | profile=%r | region=%s | demo=%s", profile, region, self.demo)
+        self.set_instances([])
         self.open_sessions.setEnabled(False); self.status.setText("●  QUERYING AWS"); logger.info("UI entered QUERYING AWS state")
-        self.thread=QThread(); self.worker=Worker(lambda: demo_instances() if self.demo else _run_with_sso(profile, lambda: list_instances(profile,region))); self.worker.moveToThread(self.thread); worker=self.worker
-        self.thread.started.connect(worker.run); worker.finished.connect(self.loaded); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        start_task(self, lambda: demo_instances() if self.demo else _run_with_sso(profile, lambda: list_instances(profile, region)),
+                   self.loaded, self.failed, self.cleanup)
     @Slot(object)
     def loaded(self, instances):
         logger.info("EC2 fleet loaded into UI | instances=%d", len(instances))
@@ -766,11 +612,10 @@ class PowerCon(BasePage):
         show_exception(self, "AWS error", "loading the EC2 fleet", exc)
     def cleanup(self):
         logger.info("AWS worker thread finished")
-        if self.thread:
-            self.thread.deleteLater()
-            self.thread = None
-        self.worker = None
+        self._selection_changed(len(self.fleet.selected_instances()))
+        self.home._set_connecting(task_busy(self.home))
     def connect_target(self):
+        if task_busy(self): return
         selected=self.fleet.selected_instances()
         if not selected:
             show_dialog(self,QMessageBox.Icon.Information,"Select EC2 targets","Select one or more EC2 instances before opening SSM sessions.","Use Home to change the AWS profile, region or reload the fleet.")
@@ -827,9 +672,10 @@ class CommandPage(BasePage):
     def _selection(self,count):
         has_command=bool(self.command.toPlainText().strip())
         self.target_summary.setText(f"{count} target{'s' if count!=1 else ''} selected")
-        self.execute.setEnabled(bool(count) and has_command)
+        self.execute.setEnabled(bool(count) and has_command and not task_busy(self))
         self.execute.setToolTip("Confirm and execute the command on the selected SSM targets." if count and has_command else "Select an SSM-ready target and enter a command first.")
     def run_command(self):
+        if task_busy(self): return
         selected=self.fleet_selection(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip(); cmd=self.command.toPlainText().strip(); os_family=self.os_family.currentText()
         if not selected:
             show_dialog(self, QMessageBox.Icon.Warning, "No targets selected", "No EC2 instances are selected for Run Command.", "Return to Terminal, select the target instances and then execute the command.")
@@ -847,78 +693,30 @@ class CommandPage(BasePage):
             self.output_status.setText("CANCELLED")
             return
         self.execute.setEnabled(False); self.output_status.setText("EXECUTING…"); self.output.clear()
-        self.thread=QThread(); self.worker=Worker(lambda: _run_with_sso(profile, lambda: send_command(profile,region,ids,cmd,os_family=os_family))); self.worker.moveToThread(self.thread); worker=self.worker
-        self.thread.started.connect(worker.run); worker.finished.connect(self.finished); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        start_task(self, lambda: send_command(profile, region, ids, cmd, os_family=os_family,
+                                             run_with_sso=_run_with_sso),
+                   self.finished, self.failed, self.cleanup)
+
+    def context_changed(self):
+        self.output.clear()
+        self.output_status.setText("CONTEXT CHANGED — previous operations may still be running in AWS")
+        self._selection(len(self.fleet_selection()))
     @Slot(object)
     def finished(self,results):
         blocks=[]
         for r in results:
             blocks.append(f"INSTANCE {r.instance_id}\nSTATUS  {r.status}\nCOMMAND {r.command_id}\n\nSTDOUT\n{r.stdout or '(empty)'}\n\nSTDERR\n{r.stderr or '(empty)'}\n{'─'*88}")
-        self.output.setPlainText("\n".join(blocks)); self.output_status.setText("COMPLETE"); self.execute.setEnabled(True)
+        self.output.setPlainText("\n".join(blocks))
+        self.output_status.setText("TRACKING LIMIT REACHED — REMOTE STATUS UNKNOWN"
+                                   if any(r.tracking_timed_out for r in results) else "COMPLETE")
     @Slot(object)
     def failed(self,exc):
         if not isinstance(exc, Exception): exc = RuntimeError(str(exc))
-        self.output_status.setText("ERROR"); self.execute.setEnabled(True)
+        self.output_status.setText("ERROR")
         show_exception(self, "SSM command failed", "executing the AWS Systems Manager Run Command", exc)
     def cleanup(self):
         logger.info("AWS worker thread finished")
-        if self.thread:
-            self.thread.deleteLater()
-            self.thread = None
-        self.worker = None
-
-
-class PerformancePage(BasePage):
-    def __init__(self, source):
-        super().__init__(); self.source=source; root=self.page_header("EBS / PERFORMANCE ANALYSIS","Performance","Inspect attached EBS volumes, publish CloudWatch dashboards and calculate EBS baselines from CSV data.")
-        grid=QGridLayout(); grid.setHorizontalSpacing(14); grid.setVerticalSpacing(14)
-        ebs=QFrame(); ebs.setObjectName("operationPanel"); ef=QVBoxLayout(ebs); ef.setContentsMargins(20,18,20,18); ef.setSpacing(10)
-        self.ebs_target=QComboBox(); self.ebs_target.setMinimumHeight(42); ef.addWidget(self._label("INSTANCE")); ef.addWidget(self.ebs_target)
-        buttons=QHBoxLayout(); self.load_ebs=QPushButton("LOAD EBS"); self.load_ebs.setObjectName("quietButton"); self.dashboard=QPushButton("CREATE CLOUDWATCH DASHBOARD"); self.dashboard.setObjectName("primaryButton"); buttons.addWidget(self.load_ebs); buttons.addWidget(self.dashboard); ef.addLayout(buttons)
-        self.ebs_output=QPlainTextEdit(); self.ebs_output.setReadOnly(True); self.ebs_output.setMinimumHeight(180); ef.addWidget(self.ebs_output); grid.addWidget(ebs,0,0)
-        csv=QFrame(); csv.setObjectName("operationPanel"); cf=QVBoxLayout(csv); cf.setContentsMargins(20,18,20,18); cf.setSpacing(10); cf.addWidget(self._label("CSV BASELINE ANALYSIS")); self.csv_path=QLineEdit(); self.csv_path.setPlaceholderText("CSV with Timestamp, IOPS and Bytes/s columns"); cf.addWidget(self.csv_path); cr=QHBoxLayout(); self.browse=QPushButton("BROWSE"); self.browse.setObjectName("quietButton"); self.analyze=QPushButton("ANALYZE BASELINE"); self.analyze.setObjectName("primaryButton"); cr.addWidget(self.browse); cr.addWidget(self.analyze); cf.addLayout(cr); self.csv_output=QPlainTextEdit(); self.csv_output.setReadOnly(True); self.csv_output.setMinimumHeight(180); cf.addWidget(self.csv_output); grid.addWidget(csv,0,1)
-        root.addLayout(grid); root.addStretch()
-        source.instancesChanged.connect(self.set_instances); self.load_ebs.clicked.connect(self.load_ebs_data); self.dashboard.clicked.connect(self.create_dashboard); self.browse.clicked.connect(self.choose_csv); self.analyze.clicked.connect(self.analyze_csv); self.ebs_target.currentIndexChanged.connect(self._target_changed); self.set_instances(source.instances)
-    def _label(self,t): l=QLabel(t); l.setObjectName("microLabel"); return l
-    def set_instances(self,instances):
-        self.ebs_target.blockSignals(True); self.ebs_target.clear(); [self.ebs_target.addItem(f"{i.name} · {i.instance_id}",i) for i in instances]; self.ebs_target.blockSignals(False); self._target_changed()
-    def _target_changed(self, *_):
-        self._volumes=[]
-        has_target=bool(self.ebs_target.currentData())
-        self.load_ebs.setEnabled(has_target); self.dashboard.setEnabled(False)
-        self.ebs_output.setPlainText("Select an instance and load its attached EBS volumes." if has_target else "Load the EC2 fleet in Terminal to inspect EBS volumes.")
-    def load_ebs_data(self):
-        i=self.ebs_target.currentData(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip()
-        if not i:
-            show_dialog(self, QMessageBox.Icon.Warning, "No target selected", "No EC2 instance is available for EBS analysis.", "Load the EC2 fleet in Terminal and select an instance first.")
-            return
-        try:
-            volumes=list_instance_volumes(profile,region,i.instance_id); self.ebs_output.setPlainText("\n".join(f"{v['Device']}  {v['VolumeId']}  {v['Type']}  {v['Size']} GiB  IOPS={v['Iops']}  Throughput={v['Throughput']} MB/s" for v in volumes) or "No EBS volumes attached."); self.ebs_target.setProperty("volumes",volumes); self._volumes=volumes; self.dashboard.setEnabled(bool(volumes))
-        except Exception as exc: show_exception(self, "EBS error", "loading EBS volume information", exc)
-    def create_dashboard(self):
-        i=self.ebs_target.currentData(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip(); volumes=getattr(self,"_volumes",[])
-        if not i or not volumes:
-            show_dialog(self, QMessageBox.Icon.Warning, "EBS data unavailable", "There is no loaded EBS volume data for the selected instance.", "Load the EBS data first. A CloudWatch dashboard can only be created after at least one volume has been discovered.")
-            return
-        try:
-            name=create_cloudwatch_dashboard(profile,region,i.name,volumes)
-            show_dialog(self, QMessageBox.Icon.Information, "CloudWatch dashboard created", f"The dashboard for {i.name} was created successfully.", f"Dashboard: {name}\nRegion: {region}")
-        except Exception as exc:
-            show_exception(self, "CloudWatch error", "creating the EBS CloudWatch dashboard", exc)
-    def choose_csv(self):
-        path = _open_csv_dialog(self, "Select CSV")
-        if path: self.csv_path.setText(path)
-    def analyze_csv(self):
-        path=self.csv_path.text().strip()
-        if not path: self.choose_csv(); path=self.csv_path.text().strip()
-        if not path: return
-        try:
-            data=calculate_baseline(path); lines=[]
-            for key,value in data.items():
-                if isinstance(value,list): lines.append(key + ":\n" + "\n".join(f"  {item}" for item in value))
-                else: lines.append(f"{key}: {value:.2f}" if isinstance(value,float) else f"{key}: {value}")
-            self.csv_output.setPlainText("\n".join(lines))
-        except Exception as exc: show_exception(self, "Baseline analysis error", "calculating the EBS performance baseline", exc)
+        self._selection(len(self.fleet_selection()))
 
 
 class FilterableTable(QFrame):
@@ -1271,6 +1069,7 @@ class CertificatesPage(BasePage):
             self.context.setText("Select an account in Terminal")
 
     def run_discovery(self):
+        if task_busy(self): return
         profile = self.source.commands.profile.currentText().strip()
         region = self.source.commands.region.currentText().strip()
         all_accounts = self.all_accounts.isChecked()
@@ -1310,16 +1109,18 @@ class CertificatesPage(BasePage):
         scope = f"{len(profiles)} AWS accounts" if all_accounts else profile
         self.summary.setText(f"Discovering ACM and ALB/NLB resources for {scope} in {region}…")
         self.status.setText("●  QUERYING AWS")
-        self.thread = QThread()
-        self.worker = Worker(lambda: _discover_certificates_for_profiles(profiles, region))
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.finished)
-        self.worker.failed.connect(self.failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self.cleanup)
-        self.thread.start()
+        start_task(self, lambda: _discover_certificates_for_profiles(profiles, region),
+                   self.finished, self.failed, self.cleanup)
+
+    def context_changed(self):
+        self.inventory = {"certificates": [], "balancers": []}
+        self.cert_table.set_rows([]); self.lb_table.set_rows([])
+        self.cert_export.setEnabled(False); self.lb_export.setEnabled(False)
+        self.cert_count.setText(self.cert_table.count_text("certificates"))
+        self.lb_count.setText(self.lb_table.count_text("correlation rows"))
+        self.summary.setText("AWS context changed. Discover certificates again.")
+        self.status.setText("◆  CONTEXT CHANGED")
+        self._update_context()
 
     @Slot(object)
     def finished(self, inventory):
@@ -1335,13 +1136,15 @@ class CertificatesPage(BasePage):
         selected = len(inventory.get("profiles", []))
         completed = len(inventory.get("inventories", []))
         failures = inventory.get("failures", [])
+        warnings = inventory.get("warnings", [])
         account_label = "account" if selected == 1 else "accounts"
         self.summary.setText(
             f"{completed}/{selected} {account_label} discovered · {len(certificates)} certificates · "
             f"{len(balancers)} ALB/NLB correlation rows · Region {inventory.get('region', '')}"
             + (f" · {len(failures)} account(s) skipped" if failures else "")
+            + (f" · {len(warnings)} warning(s): " + " · ".join(warnings[:3]) if warnings else "")
         )
-        self.status.setText("◆  INVENTORY PARTIAL" if failures else "●  INVENTORY READY")
+        self.status.setText("◆  INVENTORY PARTIAL" if failures or warnings else "●  INVENTORY READY")
         self.discover.setEnabled(True)
         self.all_accounts.setEnabled(True)
         logger.info(
@@ -1371,10 +1174,8 @@ class CertificatesPage(BasePage):
 
     def cleanup(self):
         logger.info("Certificate discovery worker thread finished")
-        if self.thread:
-            self.thread.deleteLater()
-            self.thread = None
-        self.worker = None
+        self.discover.setEnabled(True)
+        self.all_accounts.setEnabled(True)
 
 
 class Route53Page(BasePage):
@@ -1490,12 +1291,22 @@ class Route53Page(BasePage):
         self.summary.setText(f"{len(self.zones_by_id)} private hosted zones discovered · {self._zone_details(zone)}")
 
     def _start_worker(self, job, operation):
+        if task_busy(self): return
         self.job = job; self.refresh_zones.setEnabled(False); self.discover_records.setEnabled(False)
-        self.thread = QThread(); self.worker = Worker(operation); self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run); self.worker.finished.connect(self.finished); self.worker.failed.connect(self.failed)
-        self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        self.zone_selector.setEnabled(False)
+        start_task(self, operation, self.finished, self.failed, self.cleanup)
+
+    def context_changed(self):
+        self.zones_by_id = {}; self.selected_zone = None
+        self.zone_selector.blockSignals(True); self.zone_selector.clear(); self.zone_selector.blockSignals(False)
+        self.records_table.set_rows([]); self.records_export.setEnabled(False)
+        self.discover_records.setEnabled(False); self.record_count.setText("0 / 0 records")
+        self.summary.setText("AWS context changed. Discover private hosted zones again.")
+        self.status.setText("◆  CONTEXT CHANGED")
+        self._update_context()
 
     def run_zone_discovery(self):
+        if task_busy(self): return
         context = self._aws_context()
         if not context:
             return
@@ -1503,6 +1314,7 @@ class Route53Page(BasePage):
         self._start_worker("zones", lambda: _run_with_sso(profile, lambda: discover_private_hosted_zones(profile, region)))
 
     def run_record_discovery(self):
+        if task_busy(self): return
         context = self._aws_context(); zone = self._selected_zone()
         if not context or not zone:
             if context and not zone:
@@ -1548,9 +1360,8 @@ class Route53Page(BasePage):
 
     def cleanup(self):
         logger.info("Route 53 worker thread finished | job=%s", self.job)
-        if self.thread:
-            self.thread.deleteLater(); self.thread = None
-        self.worker = None; self.refresh_zones.setEnabled(True); self.discover_records.setEnabled(self._selected_zone() is not None)
+        self.zone_selector.setEnabled(True)
+        self.refresh_zones.setEnabled(True); self.discover_records.setEnabled(self._selected_zone() is not None)
 
 
 class CloudFrontPage(BasePage):
@@ -1612,6 +1423,7 @@ class CloudFrontPage(BasePage):
         self.context.setText(f"{profile}  ·  {region}" if profile else "Select an account in Terminal")
 
     def run_discovery(self):
+        if task_busy(self): return
         profile = self.source.commands.profile.currentText().strip()
         region = self.source.commands.region.currentText().strip()
         if not profile:
@@ -1621,9 +1433,15 @@ class CloudFrontPage(BasePage):
             show_dialog(self, QMessageBox.Icon.Warning, "No AWS region selected", "No region is configured in Terminal.", "Select an AWS region in Terminal and retry the CloudFront discovery.")
             return
         self._update_context(); self.discover.setEnabled(False); self.summary.setText(f"Discovering CloudFront distributions for {profile}…"); self.status.setText("●  QUERYING AWS")
-        self.thread = QThread(); self.worker = Worker(lambda: _run_with_sso(profile, lambda: discover_distributions(profile, region)))
-        self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self.finished); self.worker.failed.connect(self.failed)
-        self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        start_task(self, lambda: _run_with_sso(profile, lambda: discover_distributions(profile, region)),
+                   self.finished, self.failed, self.cleanup)
+
+    def context_changed(self):
+        self.distributions = []; self.table.set_rows([]); self.export.setEnabled(False)
+        self.count.setText(self.table.count_text("distributions"))
+        self.summary.setText("AWS context changed. Discover CloudFront distributions again.")
+        self.status.setText("◆  CONTEXT CHANGED")
+        self._update_context()
 
     @Slot(object)
     def finished(self, result):
@@ -1647,9 +1465,7 @@ class CloudFrontPage(BasePage):
 
     def cleanup(self):
         logger.info("CloudFront worker thread finished")
-        if self.thread:
-            self.thread.deleteLater(); self.thread = None
-        self.worker = None; self.discover.setEnabled(True)
+        self.discover.setEnabled(True)
 
 
 class ConnectivityMap(QGraphicsView):
@@ -1668,7 +1484,10 @@ class ConnectivityMap(QGraphicsView):
 
     def render_connections(self, source_name, rows, results=None):
         self.scene.clear()
-        result_map = {(str(item.get("service", "")), str(item.get("destination", "")), str(item.get("port", "")), str(item.get("scope", ""))): item for item in (results or [])}
+        result_map = defaultdict(deque)
+        for item in results or []:
+            key = tuple(str(item.get(field, "")) for field in ("service", "destination", "port", "scope"))
+            result_map[key].append(item)
         if not rows:
             hint = self.scene.addText("Attach a connectivity CSV to render the connection map.")
             hint.setDefaultTextColor(QColor(MUTED)); hint.setPos(28, 28); self.scene.setSceneRect(0, 0, 820, 380); return
@@ -1687,7 +1506,8 @@ class ConnectivityMap(QGraphicsView):
             title = self.scene.addText(heading); title.setDefaultTextColor(QColor(SAND if scope != "external" else SPICE)); title.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold)); title.setPos(column_x, 18)
             for index, row in enumerate(groups[scope]):
                 y = 62 + index * 104
-                result = result_map.get((row["service"], row["destination"], row["port"], row["scope"]), {})
+                matches = result_map[(row["service"], row["destination"], row["port"], row["scope"])]
+                result = matches.popleft() if matches else {}
                 status = str(result.get("status", "")).upper()
                 color = QColor(GREEN if status == "OK" else RED if status in {"KO", "FAILED", "ERROR", "TIMEOUT", "REFUSED", "UNREACHABLE"} else MUTED)
                 line = QGraphicsLineItem(source_x + source_w, source_y + source_h / 2, column_x, y + 39); line.setPen(QPen(color, 2 if status else 1.2)); line.setToolTip(f"{row['service']} → {row['destination']}:{row['port']} · {status or 'PENDING'}"); self.scene.addItem(line)
@@ -1695,7 +1515,7 @@ class ConnectivityMap(QGraphicsView):
                 text = self.scene.addText(row["service"][:30]); text.setDefaultTextColor(QColor(TEXT)); text.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold)); text.setPos(column_x + 12, y + 10)
                 text = self.scene.addText(f"{row['destination']}:{row['port']}  ·  {row['protocol']}"); text.setDefaultTextColor(QColor(MUTED)); text.setFont(QFont("Segoe UI", 8)); text.setPos(column_x + 12, y + 32)
                 text = self.scene.addText(status or "PENDING"); text.setDefaultTextColor(color); text.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold)); text.setPos(column_x + 12, y + 54)
-        legend = self.scene.addText("CONNECTION MAP  ·  green: reachable  ·  red: failed or timed out  ·  grey: not tested")
+        legend = self.scene.addText("CONNECTION MAP  ·  green: reachable  ·  red: failed or timed out  ·  grey: no result / not tested")
         legend.setDefaultTextColor(QColor(MUTED)); legend.setFont(QFont("Segoe UI", 8)); legend.setPos(24, 14)
         self.scene.setSceneRect(0, 0, target_x + len(columns) * 305, max(290, 92 + max_rows * 104))
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -1709,12 +1529,14 @@ class ConnectivityPage(BasePage):
 
         panel=QFrame(); panel.setObjectName("operationPanel"); form=QVBoxLayout(panel); form.setContentsMargins(22,20,22,22); form.setSpacing(12)
         top=QHBoxLayout(); self.target=QComboBox(); self.target.setMinimumHeight(42); top.addWidget(self._field("SOURCE INSTANCE",self.target),2)
-        self.timeout=QLineEdit("120"); self.timeout.setMinimumHeight(42); top.addWidget(self._field("TIMEOUT (S)",self.timeout),0)
+        self.timeout=QLineEdit("120"); self.timeout.setMinimumHeight(42)
+        self.timeout.setToolTip("TCP timeout per destination. The overall SSM wait budget scales with the matrix size.")
+        top.addWidget(self._field("TIMEOUT / HOST (S)",self.timeout),0)
         self.csv_path=QLineEdit(); self.csv_path.setReadOnly(True); self.csv_path.setPlaceholderText("No connectivity CSV loaded"); top.addWidget(self._field("CONNECTIVITY MATRIX",self.csv_path),3)
         self.browse=QPushButton("ATTACH CSV"); self.browse.setObjectName("quietButton"); self.browse.setMinimumHeight(42); top.addWidget(self.browse,0,Qt.AlignmentFlag.AlignBottom)
         self.validate=QPushButton("RUN VALIDATION  →"); self.validate.setObjectName("primaryButton"); self.validate.setMinimumHeight(42); top.addWidget(self.validate,0,Qt.AlignmentFlag.AlignBottom)
         form.addLayout(top)
-        self.summary=QLabel("Load a CSV and select a source instance to begin."); self.summary.setObjectName("tunnelInfo"); form.addWidget(self.summary)
+        self.summary=QLabel("Load a CSV and select a source instance to begin."); self.summary.setObjectName("tunnelInfo"); self.summary.setWordWrap(True); form.addWidget(self.summary)
         root.addWidget(panel)
 
         splitter=QHBoxLayout(); splitter.setSpacing(14)
@@ -1747,7 +1569,7 @@ class ConnectivityPage(BasePage):
         if self.rows: self.connection_map.render_connections(self._source_name(),self.rows)
         self._update_validation_action()
     def _update_validation_action(self, *_):
-        ready=bool(self.target.currentData()) and bool(self.rows)
+        ready=bool(self.target.currentData()) and bool(self.rows) and not task_busy(self)
         self.validate.setEnabled(ready)
         self.validate.setToolTip("Run the matrix from the selected SSM source instance." if ready else "Select an SSM-ready source instance and attach a connectivity CSV first.")
     def _source_name(self):
@@ -1769,6 +1591,7 @@ class ConnectivityPage(BasePage):
             logger.exception("Connectivity CSV load failed")
             show_exception(self,"Connectivity CSV","loading the connectivity CSV",exc,QMessageBox.Icon.Warning)
     def run(self):
+        if task_busy(self): return
         i=self.target.currentData(); profile=self.source.commands.profile.currentText().strip(); region=self.source.commands.region.currentText().strip()
         if not i:
             show_dialog(self,QMessageBox.Icon.Warning,"No source instance","No EC2 source instance is available.","Load the EC2 fleet in Terminal first and select an instance for the connectivity test."); return
@@ -1780,8 +1603,17 @@ class ConnectivityPage(BasePage):
             show_dialog(self,QMessageBox.Icon.Warning,"Invalid timeout","The connectivity timeout must be between 1 and 300 seconds.","Enter a valid timeout and retry."); return
         self.validate.setEnabled(False); self.browse.setEnabled(False); self.summary.setText(f"Running validation from {i.name} in {region}…"); self.results_table.setRowCount(0); self.detail.clear()
         self.connection_map.render_connections(self._source_name(),self.rows)
-        self.thread=QThread(); self.worker=Worker(lambda: _run_with_sso(profile,lambda: validate_connectivity_csv(profile,region,i.instance_id,self.rows,timeout))); self.worker.moveToThread(self.thread); worker=self.worker
-        self.thread.started.connect(worker.run); worker.finished.connect(self.finished); worker.failed.connect(self.failed); worker.finished.connect(self.thread.quit); worker.failed.connect(self.thread.quit); self.thread.finished.connect(self.cleanup); self.thread.start()
+        rows = [dict(row) for row in self.rows]
+        self.target.setEnabled(False)
+        start_task(self, lambda: validate_connectivity_csv(profile, region, i.instance_id, rows, timeout,
+                                                          run_with_sso=_run_with_sso),
+                   self.finished, self.failed, self.cleanup)
+
+    def context_changed(self):
+        self.results_table.setRowCount(0); self.detail.clear()
+        self.connection_map.render_connections(self._source_name(), self.rows)
+        self.summary.setText("AWS context changed. Select a source instance and validate again.")
+        self._update_validation_action()
     @Slot(object)
     def finished(self,payload):
         results,command_result=payload; self.results_table.setRowCount(0)
@@ -1795,9 +1627,13 @@ class ConnectivityPage(BasePage):
                     elif status in {"KO", "FAILED", "ERROR", "TIMEOUT"}: item.setForeground(QColor(RED))
                     else: item.setForeground(QColor(SAND))
                 self.results_table.setItem(r,c,item)
-        ok=sum(1 for r in results if r.get("status","").upper()=="OK"); ko=len(results)-ok
+        ok=sum(1 for r in results if r.get("status","").upper()=="OK")
+        missing=sum(1 for r in results if r.get("status","").upper() in {"UNKNOWN", "NO_RESULT"})
+        ko=len(results)-ok-missing
+        complete=bool(self.rows) and len(results) == len(self.rows) and not missing and not command_result.tracking_timed_out and command_result.status == "Success"
         self.connection_map.render_connections(self._source_name(),self.rows,results)
-        self.summary.setText(f"Validated {len(results)} services · OK {ok} · KO {ko} · Source {self.target.currentData().name if self.target.currentData() else ''} · Region {self.source.commands.region.currentText()}")
+        self.summary.setText(f"{'Validated' if complete else 'Partial validation'} · Reported {len(results)-missing}/{len(self.rows)} services · OK {ok} · KO {ko} · No result {missing} · Source {self.target.currentData().name if self.target.currentData() else ''} · Region {self.source.commands.region.currentText()} · SSM {command_result.status} · Command {command_result.command_id}")
+        self.status.setText("●  RESULTS READY" if complete else "◆  PARTIAL RESULTS — REVIEW COMMAND STATUS")
         self.browse.setEnabled(True); self._update_validation_action()
         logger.info("Connectivity UI updated | results=%d | ok=%d | ko=%d",len(results),ok,ko)
     @Slot(object)
@@ -1812,320 +1648,8 @@ class ConnectivityPage(BasePage):
         self.detail.setPlainText("Service: %s\nDestination: %s\nPort: %s\nScope: %s\nStatus: %s\nDuration: %s ms\nDetail: %s" % tuple(values))
     def cleanup(self):
         logger.info("Connectivity worker thread finished")
-        if self.thread: self.thread.deleteLater(); self.thread=None
-        self.worker=None
-
-
-STYLE = """
-* { font-family: "Segoe UI", "Inter", sans-serif; color: #eee9df; }
-QMainWindow { background: #080a0b; }
-QToolTip { background: #151b1c; color: #eee9df; border: 1px solid #3b3930; padding: 6px; }
-#sidebar { background: #090b0c; border-right: 1px solid #252b2a; }
-#brandLogo { background: transparent; padding: 0; }
-#brandRule { background: rgba(185,104,54,0.48); margin: 0 8px; }
-#sidebarSection { color: #9a8666; font-size: 9px; font-weight: 780; letter-spacing: 1.7px; padding-left: 11px; }
-#eyebrow, #microLabel { color: #b5a078; font-size: 9px; font-weight: 760; letter-spacing: 1.5px; }
-#navButton { text-align: left; border: 0; border-left: 2px solid transparent; border-radius: 0; padding: 8px 10px; color: #777d79; font-size: 10px; font-weight: 700; background: transparent; }
-#navButton:hover { background: rgba(199,165,106,0.035); color: #d7d0c4; }
-#navButton:checked { background: rgba(185,104,54,0.035); color: #e0c68e; border-left: 2px solid #b96836; padding-left: 10px; }
-#divider { background: #252b2a; }
-#sideProfile { color: #c9c0ae; font-size: 10px; line-height: 1.4; }
-#sideStatus { color: #7ea67a; font-size: 9px; font-weight: 760; letter-spacing: 1.2px; margin-top: 5px; }
-#sideStatus[connectionState="context"], #sideStatus[connectionState="connecting"] { color: #c7a56a; }
-#sideStatus[connectionState="error"] { color: #c56f60; }
-#sidebarVersion { color: #84785f; font-size: 8px; font-weight: 720; letter-spacing: 1.35px; padding: 2px 0; }
-#backdrop { background: #080a0b; }
-#homeContext { color: #c9c0ae; font-size: 11px; background: rgba(8,10,11,0.50); border: 1px solid rgba(199,165,106,0.16); border-radius: 6px; padding: 10px 16px; }
-#terminalContext { color: #d7d0c4; font-size: 11px; font-weight: 650; }
-#pageEyebrow { color: #777d79; font-size: 9px; font-weight: 760; letter-spacing: 2.1px; }
-#pageTitle { font-size: 31px; font-weight: 690; color: #eee9df; }
-#pageSubtitle { color: #8b918d; font-size: 11px; }
-#topStatus { background: rgba(185,104,54,0.10); border: 1px solid rgba(185,104,54,0.28); border-radius: 14px; color: #d47a3f; padding: 7px 12px; font-size: 9px; font-weight: 760; letter-spacing: 1px; }
-#commandRail, #operationPanel, #tunnelPanel { background: rgba(17,22,23,0.93); border: 1px solid #29302f; border-top: 2px solid rgba(185,104,54,0.52); border-radius: 11px; }
-QComboBox, QLineEdit, QPlainTextEdit { background: #0e1314; border: 1px solid #28302f; border-radius: 7px; padding: 9px 11px; color: #eee9df; selection-background-color: #3a2d1d; }
-QComboBox:hover, QLineEdit:hover, QPlainTextEdit:hover { border-color: #424946; }
-QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border: 2px solid #d3914d; padding: 8px 10px; }
-QComboBox::drop-down { border: 0; width: 28px; }
-QComboBox::down-arrow { image: none; width: 6px; height: 6px; border-right: 1px solid #c7a56a; border-bottom: 1px solid #c7a56a; margin-right: 10px; }
-QComboBox QAbstractItemView { background: #101516; border: 1px solid #4a3529; selection-background-color: #352217; selection-color: #d47a3f; padding: 6px; outline: 0; }
-QComboBox QLineEdit { background: #0e1314; color: #eee9df; border: 0; padding: 0; selection-background-color: #3a2d1d; selection-color: #eee9df; }
-QComboBox QLineEdit:focus { background: #0e1314; color: #eee9df; border: 0; }
-#quietButton, #primaryButton { border-radius: 7px; padding: 10px 14px; font-weight: 760; font-size: 10px; letter-spacing: .8px; }
-#quietButton { background: #171d1e; border: 1px solid #303735; color: #c9c0ae; }
-#quietButton:hover { background: #1d2425; border-color: #4a4c45; }
-#primaryButton { background: #c7a56a; color: #16120d; }
-#primaryButton:hover { background: #dfbd7f; }
-#quietButton:focus, #primaryButton:focus, #navButton:focus, QToolButton:focus { border: 2px solid #d3914d; outline: 0; }
-#metricStrip { background: rgba(13,17,18,0.78); border-top: 1px solid #252c2b; border-bottom: 1px solid #252c2b; }
-#metricBlock { background: transparent; }
-#metricSeparator { background: #252c2b; }
-#metricCaption { color: #777d79; font-size: 8px; font-weight: 760; letter-spacing: 1.7px; }
-#metricNumber { color: #eee9df; font-size: 23px; font-weight: 680; }
-#metricDetail { color: #656c68; font-size: 8px; font-weight: 650; letter-spacing: 1px; }
-#fleetPanel { background: rgba(15,20,21,0.90); border: 1px solid #29302f; border-radius: 11px; border-top-color: rgba(185,104,54,0.35); }
-#fleetContent { background: transparent; }
-#sectionTitle { color: #d7d0c4; font-size: 10px; font-weight: 780; letter-spacing: 1.8px; }
-#sectionCounter { color: #7e8480; font-size: 9px; font-weight: 760; letter-spacing: 1.2px; }
-#sectionLine { background: rgba(185,104,54,0.34); }
-#instanceRow { background: rgba(18,24,25,0.88); border: 1px solid #242c2b; border-radius: 8px; }
-#instanceRow:hover { background: rgba(27,34,34,0.95); border-color: #3a403d; }
-#instanceRow[selected="true"] { background: rgba(185,104,54,0.085); border-color: #7f4b2f; }
-#instanceName { color: #eee9df; font-size: 12px; font-weight: 670; }
-#instanceId { color: #69716c; font-size: 9px; }
-#fleetEmpty { color: #858a86; font-size: 11px; padding: 42px 18px; }
-#rowMeta { color: #858a86; font-size: 9px; font-weight: 760; letter-spacing: 1px; }
-#rowValue { color: #c9c4b9; font-size: 10px; }
-#stateBadge { color: #777d79; font-size: 9px; font-weight: 760; letter-spacing: .7px; min-width: 92px; }
-#stateBadge[running="true"] { color: #7ea67a; }
-#ssmBadge { font-size: 9px; font-weight: 760; letter-spacing: .6px; color: #c7a56a; }
-#ssmBadge[ssmState="online"] { color: #7ea67a; }
-#ssmBadge[ssmState="connectionlost"], #ssmBadge[ssmState="inactive"], #ssmBadge[ssmState="unmanaged"] { color: #c56f60; }
-QCheckBox::indicator { width: 15px; height: 15px; border-radius: 4px; border: 1px solid #4a504d; background: #0d1213; }
-QCheckBox::indicator:hover { border-color: #9f824f; }
-QCheckBox::indicator:checked { background: #b96836; border-color: #b96836; }
-QScrollArea { background: transparent; border: 0; }
-QScrollArea > QWidget > QWidget { background: transparent; }
-QScrollBar:vertical { background: transparent; width: 7px; margin: 4px 0; }
-QScrollBar::handle:vertical { background: #343b38; border-radius: 3px; min-height: 28px; }
-QScrollBar::handle:vertical:hover { background: #555b56; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
-
-/* ------------------------------------------------------------------
-   Dialogs / transient windows
-   Keep every application-owned popup inside the Arrakis visual system.
-   The OS title bar may remain platform-controlled, but the dialog body,
-   labels, controls and buttons must never fall back to Fusion white.
-   ------------------------------------------------------------------ */
-QDialog, QMessageBox {
-    background: #0d1112;
-    color: #eee9df;
-}
-QDialog QLabel, QMessageBox QLabel {
-    color: #c9c4b9;
-    background: transparent;
-}
-QDialog QPlainTextEdit, QDialog QTextEdit, QMessageBox QPlainTextEdit, QMessageBox QTextEdit {
-    background: #090d0e;
-    color: #c9c4b9;
-    border: 1px solid #29302f;
-    border-radius: 6px;
-    selection-background-color: #3a2b1e;
-    selection-color: #eee9df;
-    font-family: "Cascadia Mono", "Consolas", monospace;
-    font-size: 10px;
-}
-QDialog QPushButton, QMessageBox QPushButton {
-    background: #171d1e;
-    border: 1px solid #303735;
-    border-radius: 6px;
-    color: #c9c0ae;
-    padding: 8px 14px;
-    min-width: 78px;
-}
-QDialog QPushButton:hover, QMessageBox QPushButton:hover {
-    background: #1d2425;
-    border-color: #4a4c45;
-    color: #eee9df;
-}
-QDialog QPushButton:default, QDialog QPushButton:focus,
-QMessageBox QPushButton:default, QMessageBox QPushButton:focus {
-    border-color: #b96836;
-}
-QMessageBox QCheckBox, QDialog QCheckBox {
-    color: #858a86;
-}
-QMessageBox QTextBrowser {
-    background: #090d0e;
-    color: #a9aaa3;
-    border: 1px solid #29302f;
-}
-
-/* ------------------------------------------------------------------
-   File dialogs
-   Force the widget-based QFileDialog into the same obsidian/melange
-   visual system as the main application.
-   ------------------------------------------------------------------ */
-QFileDialog {
-    background: #0d1112;
-    color: #eee9df;
-    border: 1px solid #29302f;
-}
-QFileDialog QLabel {
-    color: #858a86;
-}
-QFileDialog QLineEdit,
-QFileDialog QComboBox {
-    background: #0e1314;
-    border: 1px solid #29302f;
-    border-radius: 6px;
-    color: #eee9df;
-    selection-background-color: #3a2b1e;
-    padding: 7px 9px;
-}
-QFileDialog QLineEdit:focus,
-QFileDialog QComboBox:focus {
-    border-color: #b96836;
-}
-QFileDialog QAbstractItemView {
-    background: #0d1112;
-    alternate-background-color: #111617;
-    color: #c9c4b9;
-    border: 1px solid #29302f;
-    selection-background-color: #3a2b1e;
-    selection-color: #eee9df;
-    outline: none;
-}
-QFileDialog QAbstractItemView::item {
-    padding: 6px 8px;
-}
-QFileDialog QAbstractItemView::item:hover {
-    background: #171d1e;
-}
-QFileDialog QAbstractItemView::item:selected {
-    background: #3a2b1e;
-    color: #eee9df;
-}
-QFileDialog QHeaderView {
-    background: #0d1112;
-}
-QFileDialog QHeaderView::section {
-    background: #171d1e;
-    color: #858a86;
-    border: 0;
-    border-right: 1px solid #29302f;
-    border-bottom: 1px solid #29302f;
-    padding: 7px 8px;
-    font-size: 9px;
-    font-weight: 700;
-}
-QFileDialog QPushButton {
-    background: #171d1e;
-    border: 1px solid #303735;
-    border-radius: 6px;
-    color: #c9c0ae;
-    padding: 8px 14px;
-    min-width: 72px;
-}
-QFileDialog QPushButton:hover {
-    background: #1d2425;
-    border-color: #4a4c45;
-    color: #eee9df;
-}
-QFileDialog QPushButton:default,
-QFileDialog QPushButton:enabled:focus {
-    border-color: #b96836;
-}
-QFileDialog QToolButton {
-    background: #111617;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    color: #c9c0ae;
-    padding: 5px;
-}
-QFileDialog QToolButton:hover {
-    background: #1d2425;
-    border-color: #303735;
-}
-QFileDialog QSplitter::handle {
-    background: #29302f;
-}
-QFileDialog QScrollBar:vertical {
-    background: #0d1112;
-    width: 8px;
-}
-QFileDialog QScrollBar::handle:vertical {
-    background: #343b38;
-    border-radius: 4px;
-    min-height: 28px;
-}
-QFileDialog QScrollBar::add-line,
-QFileDialog QScrollBar::sub-line {
-    height: 0;
-}
-
-/* ------------------------------------------------------------------
-   Data tables
-   Keep item views inside the Arrakis/SpiceConex dark visual system.
-   Qt's Fusion defaults otherwise paint QTableWidget with the platform
-   palette, which produces the white blocks visible on Connectivity.
-   ------------------------------------------------------------------ */
-QTableWidget {
-    background-color: #0d1112;
-    alternate-background-color: #111617;
-    color: #c9c4b9;
-    border: 1px solid #29302f;
-    border-radius: 5px;
-    gridline-color: #202725;
-    selection-background-color: #3a2b1e;
-    selection-color: #eee9df;
-    outline: none;
-    font-family: "Segoe UI", "Inter", sans-serif;
-    font-size: 9px;
-}
-QTableWidget::item {
-    padding: 5px 7px;
-    border: 0;
-}
-QTableWidget::item:hover {
-    background-color: #171d1e;
-}
-QTableWidget::item:selected {
-    background-color: #3a2b1e;
-    color: #f0e8d8;
-}
-QHeaderView {
-    background: #0d1112;
-}
-QHeaderView::section {
-    background-color: #171d1e;
-    color: #858a86;
-    border: 0;
-    border-right: 1px solid #29302f;
-    border-bottom: 1px solid #343a37;
-    padding: 6px 7px;
-    min-height: 25px;
-    font-size: 8px;
-    font-weight: 700;
-}
-QHeaderView::section:first {
-    border-left: 0;
-}
-QHeaderView::section:hover {
-    background-color: #202625;
-    color: #c7a56a;
-}
-QTableCornerButton::section {
-    background-color: #171d1e;
-    border: 0;
-    border-bottom: 1px solid #343a37;
-}
-#tunnelInfo, #footerText { color: #858a86; font-size: 9px; }
-#footerMark { color: #b96836; font-size: 8px; font-weight: 760; letter-spacing: 1.8px; }
-#sidebarUpdateButton { background: #111617; color: #c7a56a; border: 1px solid #3b3027; border-radius: 4px; padding: 7px 9px; font-size: 8px; font-weight: 760; letter-spacing: 1.1px; }
-#sidebarUpdateButton:hover { background: #1b2122; border-color: #b96836; color: #eee9df; }
-#sidebarUpdateButton:disabled { color: #686d68; border-color: #252b2a; }
-#outputBox { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 10px; }
-#logViewer { background: #0d1112; }
-#logViewer #logOutput { background: #090d0e; border: 1px solid #29302f; border-radius: 6px; color: #c9c4b9; selection-background-color: #3a2b1e; }
-#inventoryContext { color: #c9c0ae; font-size: 11px; font-weight: 650; }
-#inventoryTabs { background: transparent; border: 0; }
-#inventoryTabs::pane { background: rgba(15,20,21,0.90); border: 1px solid #29302f; border-top: 2px solid rgba(185,104,54,0.35); border-radius: 0 9px 9px 9px; }
-#inventoryTabs QTabBar::tab { background: #111617; color: #777d79; border: 1px solid #29302f; border-bottom: 0; padding: 9px 18px; margin-right: 4px; min-width: 130px; font-size: 9px; font-weight: 760; letter-spacing: 1.2px; }
-#inventoryTabs QTabBar::tab:selected { background: #171d1e; color: #d9b979; border-top: 2px solid #b96836; }
-#inventoryTabs QTabBar::tab:hover { color: #eee9df; background: #1b2122; }
-#filterTable { background: transparent; border: 0; }
-#columnFilterScroll { background: transparent; border: 0; }
-#columnFilterHost { background: transparent; }
-#columnFilter { background: #0e1314; border: 1px solid #29302f; border-radius: 5px; color: #a9aaa3; padding: 5px 7px; font-size: 8px; }
-#columnFilter:hover { border-color: #424946; }
-#columnFilter:focus { border-color: #b96836; color: #eee9df; }
-#columnFilterCombo { background: #0e1314; border: 1px solid #29302f; border-radius: 5px; color: #a9aaa3; padding: 5px 7px; font-size: 8px; }
-#columnFilterCombo:hover { border-color: #424946; }
-#columnFilterCombo:focus { border-color: #b96836; color: #eee9df; }
-#columnFilterCombo::drop-down { border: 0; width: 22px; }
-#columnFilterCombo::down-arrow { image: none; width: 5px; height: 5px; border-right: 1px solid #c7a56a; border-bottom: 1px solid #c7a56a; margin-right: 8px; }
-#columnFilterCombo QAbstractItemView { background: #101516; border: 1px solid #4a3529; selection-background-color: #352217; selection-color: #d47a3f; padding: 5px; outline: 0; }
-"""
+        self.target.setEnabled(True); self.browse.setEnabled(True)
+        self._update_validation_action()
 
 
 class FlowLogMap(QGraphicsView):
@@ -2212,9 +1736,27 @@ class FlowLogsPage(BasePage):
         return box
     def _context(self): return self.source.commands.profile.currentText().strip(), self.source.commands.region.currentText().strip() or DEFAULT_REGION
     def load_flow_logs(self):
+        if task_busy(self): return
         profile,region=self._context()
         if not profile: show_dialog(self,QMessageBox.Icon.Warning,"AWS profile","Select an AWS profile in Terminal before discovering Flow Logs."); return
-        self.discover.setEnabled(False); self.status.setText("●  DISCOVERING VPC INVENTORY"); self.thread=QThread(); self.worker=Worker(lambda:_run_with_sso(profile,lambda:discover_vpc_flow_inventory(profile,region))); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self._logs_loaded); self.worker.failed.connect(self._failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self._cleanup); self.thread.start()
+        self.discover.setEnabled(False); self.analyse.setEnabled(False)
+        self.vpc.setEnabled(False); self.interface.setEnabled(False)
+        self.status.setText("●  DISCOVERING VPC INVENTORY")
+        start_task(self, lambda: _run_with_sso(profile, lambda: discover_vpc_flow_inventory(profile, region)),
+                   self._logs_loaded, self._failed, self._cleanup)
+
+    def context_changed(self):
+        self.flow_logs = []; self.interfaces = []; self.selected_flow_log = None
+        self.rows = []; self.analysis_vpc = ""; self.analysis_truncated = False
+        self.analysis_normalised = False; self.analysis_raw_groups = 0
+        self.vpc.blockSignals(True); self.vpc.clear(); self.vpc.blockSignals(False)
+        self.interface.blockSignals(True); self.interface.clear(); self.interface.blockSignals(False)
+        self.table.set_rows([]); self.map.scene.clear()
+        self.export_csv.setEnabled(False); self.export_png.setEnabled(False); self.analyse.setEnabled(False)
+        self.context.setText("AWS context changed. Discover VPC Flow Logs again.")
+        self.route_context.setText("Select a grouped route after discovering the new AWS context.")
+        self.detail.setText("No Flow Log inventory loaded for the current AWS context.")
+        self.status.setText("◆  CONTEXT CHANGED")
     @Slot(object)
     def _logs_loaded(self, inventory):
         self.flow_logs=inventory["flow_logs"]; self.interfaces=inventory["interfaces"]; self.vpc.blockSignals(True); self.vpc.clear()
@@ -2253,7 +1795,7 @@ class FlowLogsPage(BasePage):
         vpc_id=self.vpc.currentData(); interface=(self.interface.currentData() or {}).get("InterfaceId", "")
         selected_interface=self.interface.currentData() or {}
         flow_log=self._flow_log_for_interface(vpc_id,selected_interface) if interface else None
-        self.selected_flow_log=flow_log; self.analyse.setEnabled(bool(self.interface.count()))
+        self.selected_flow_log=flow_log; self.analyse.setEnabled(bool(self.interface.count()) and not task_busy(self))
         scope=flow_log.get("Scope", "") if flow_log else ""
         if flow_log:
             self.analyse.setToolTip(f"Analyse {scope.lower()} Flow Log {flow_log.get('FlowLogId', '')} with CloudWatch Logs Insights")
@@ -2273,6 +1815,7 @@ class FlowLogsPage(BasePage):
             return None
         return start,end
     def run_analysis(self):
+        if task_busy(self): return
         flow_log=self.selected_flow_log; interface=self.interface.currentData() or {}; profile,region=self._context(); start=self.start.dateTime().toPython().replace(tzinfo=timezone.utc); end=self.end.dateTime().toPython().replace(tzinfo=timezone.utc)
         if not interface:
             show_dialog(self,QMessageBox.Icon.Warning,"Flow Log analysis","Select an interface before generating a report.")
@@ -2284,7 +1827,16 @@ class FlowLogsPage(BasePage):
         logger.info("Flow Log analysis requested | flow_log=%s vpc=%s interface=%s start=%s end=%s",flow_log.get("FlowLogId",""),flow_log.get("VpcId",""),interface.get("InterfaceId",""),start.isoformat(),end.isoformat())
         policy=self._ephemeral_policy()
         if not policy: return
-        aggregation=self.grouping_filter.currentData() or "service"; normalise=bool(self.port_mode_filter.currentData()); ephemeral_start,ephemeral_end=policy; self.analyse.setEnabled(False); self.status.setText("●  ANALYSING FLOW LOGS"); self.detail.setText(f"Querying CloudWatch Logs Insights ({aggregation} grouping): {flow_log.get('LogGroupName') or 'unknown'}…"); self.thread=QThread(); self.worker=Worker(lambda:_run_with_sso(profile,lambda:analyse_flow_log(profile,region,flow_log,start,end,interface.get("InterfaceId", ""),interface.get("PrivateIps") or [interface.get("PrivateIp", "")],aggregation,normalise,ephemeral_start,ephemeral_end))); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.finished.connect(self._analysis_ready); self.worker.failed.connect(self._failed); self.worker.finished.connect(self.thread.quit); self.worker.failed.connect(self.thread.quit); self.thread.finished.connect(self._cleanup); self.thread.start()
+        aggregation=self.grouping_filter.currentData() or "service"; normalise=bool(self.port_mode_filter.currentData()); ephemeral_start,ephemeral_end=policy
+        self.analyse.setEnabled(False); self.discover.setEnabled(False)
+        self.vpc.setEnabled(False); self.interface.setEnabled(False)
+        self.status.setText("●  ANALYSING FLOW LOGS")
+        self.detail.setText(f"Querying CloudWatch Logs Insights ({aggregation} grouping): {flow_log.get('LogGroupName') or 'unknown'}…")
+        start_task(self, lambda: _run_with_sso(profile, lambda: analyse_flow_log(
+            profile, region, flow_log, start, end, interface.get("InterfaceId", ""),
+            interface.get("PrivateIps") or [interface.get("PrivateIp", "")],
+            aggregation, normalise, ephemeral_start, ephemeral_end)),
+            self._analysis_ready, self._failed, self._cleanup)
     @Slot(object)
     def _analysis_ready(self,result):
         self.rows=result["rows"]; self.analysis_vpc=result["vpc_id"]; self.analysis_raw_groups=result.get("raw_groups",len(self.rows)); self.analysis_normalised=bool(result.get("normalised")); self.analysis_truncated=self.analysis_raw_groups >= 10000; self._rank_changed(); self.export_csv.setEnabled(bool(self.rows)); self.export_png.setEnabled(bool(self.rows)); self.analyse.setEnabled(True); self.status.setText("●  FLOW ANALYSIS READY" if self.rows else "◆  NO FLOWS FOR THIS INTERFACE / RANGE")
@@ -2328,8 +1880,8 @@ class FlowLogsPage(BasePage):
     def _failed(self,exc):
         self.discover.setEnabled(True); self._vpc_selected(); self.status.setText("◆  FLOW LOG ERROR"); show_exception(self,"VPC Flow Log analysis failed","discovering or querying VPC Flow Logs",exc if isinstance(exc,Exception) else RuntimeError(str(exc)))
     def _cleanup(self):
-        if self.thread: self.thread.deleteLater(); self.thread=None
-        self.worker=None
+        self.discover.setEnabled(True); self.vpc.setEnabled(True); self.interface.setEnabled(True)
+        self._flow_selected()
 
 
 class AwsIconProvider(QObject):
@@ -3239,6 +2791,7 @@ class ArchitecturePage(BasePage):
         self.demo = demo
         self.graph: InfrastructureGraph | None = None
         self.thread = None
+        self.bind_aws_context()
         # Discovery is intentionally a dedicated SRE workspace.  Keeping its
         # configuration separate means the map, inventory and DR views can use
         # the full available height once discovery has completed.
@@ -3366,6 +2919,13 @@ class ArchitecturePage(BasePage):
             lambda exc: show_exception(self, "DR dashboard", "preparing or publishing the DR dashboard", exc), demo,
         )
         self.tabs.addTab(self.dr_page, "DR DASHBOARD")
+        self.global_inventory = GlobalInventoryPage(
+            [self.source.commands.profile.itemText(index) for index in range(self.source.commands.profile.count())],
+            self.source.commands.profile.currentText(), self.source.commands.region.currentText(), _run_with_sso,
+            lambda exc: show_exception(self, "GlobalInventory", "reading or exporting the aggregate inventory", exc),
+            demo=demo,
+        )
+        self.tabs.addTab(self.global_inventory, "GlobalInventory")
         self.source.commands.profile.currentTextChanged.connect(self.dr_page.profile_changed)
         root.addWidget(self.tabs, 1)
 
@@ -3391,6 +2951,7 @@ class ArchitecturePage(BasePage):
         self.region_scope_panel.setVisible(visible)
 
     def run_discovery(self):
+        if task_busy(self): return
         profile = self.source.commands.profile.currentText().strip()
         region = self.source.commands.region.currentText().strip() or DEFAULT_REGION
         tag_key = self.tag_key.currentText().strip() or DEFAULT_TAG_KEY
@@ -3410,19 +2971,15 @@ class ArchitecturePage(BasePage):
         self.discover.setEnabled(False)
         self.status.setText("●  DISCOVERING INFRASTRUCTURE")
         self.status_detail.setText(f"Querying AWS · {profile} · {region} · {scope} · tag {tag_key}")
-        QApplication.processEvents()
         if self.demo:
             self.graph = self._demo_graph(); self._populate(self.graph); self.discover.setEnabled(True); return
-        self.thread = QThread()
-        self.worker = Worker(lambda: _run_with_sso(profile, lambda: discover_infrastructure(profile, region, scope, tag_key, selected_regions)))
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self._discovery_finished)
-        self.worker.failed.connect(self._discovery_failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup)
-        self.thread.start()
+        start_task(self, lambda: _run_with_sso(profile, lambda: discover_infrastructure(
+            profile, region, scope, tag_key, selected_regions)),
+            self._discovery_finished, self._discovery_failed, self._cleanup)
+
+    def context_changed(self):
+        self.clear_view()
+        self.status.setText("◆  CONTEXT CHANGED — DISCOVER AGAIN")
 
     @Slot(object)
     def _discovery_finished(self, graph):
@@ -3434,7 +2991,7 @@ class ArchitecturePage(BasePage):
         self.resource_export.setEnabled(bool(graph.nodes))
         self.export_png.setEnabled(bool(graph.nodes))
         if graph.nodes:
-            self.status.setText("●  DISCOVERY COMPLETE")
+            self.status.setText("◆  INVENTORY PARTIAL — REVIEW WARNINGS" if graph.warnings else "●  DISCOVERY COMPLETE")
             logger.info("Architecture discovery completed | resources=%d | relationships=%d | warnings=%d", len(graph.nodes), len(graph.edges), len(graph.warnings))
         else:
             self.status.setText("◆  DISCOVERY RETURNED NO RESOURCES")
@@ -3456,9 +3013,7 @@ class ArchitecturePage(BasePage):
         show_exception(self, "Architecture discovery failed", "discovering AWS infrastructure", exc)
 
     def _cleanup(self):
-        if self.thread:
-            self.thread.deleteLater(); self.thread = None
-        self.worker = None
+        self.discover.setEnabled(True)
 
     def _populate(self, graph):
         tag_key = self.tag_key.currentText().strip() or DEFAULT_TAG_KEY
@@ -3508,6 +3063,7 @@ class ArchitecturePage(BasePage):
         self.dr_page.set_context(graph, application, tag_key)
 
     def clear_view(self):
+        self.aws_context.revision += 1
         self.graph = None; self.inventory.set_rows([]); self.inventory.clear_filters(); self.inventory_count.setText("0 / 0 resources"); self.application.clear(); self.application.addItem("ALL PRODUCTS"); self.tag_key.setCurrentText(DEFAULT_TAG_KEY); self.map_detail.setCurrentText("CONCEPT MAP"); self.count.setText("0 RESOURCES"); self.context.setText("No infrastructure discovered"); self.status_detail.setText("Discovery has not been run."); self.map.clear_map(); self.refresh_view.setEnabled(False); self.export_csv.setEnabled(False); self.resource_export.setEnabled(False); self.export_png.setEnabled(False); self.status.setText("◆  READY")
         self.dr_page.set_context(None, "ALL PRODUCTS", DEFAULT_TAG_KEY)
 
@@ -3556,7 +3112,7 @@ class LogViewer(QDialog):
             content = log_path().read_text(encoding="utf-8") if log_path().exists() else "No log entries yet."
         except OSError as exc:
             content = f"Unable to read log file: {exc}"
-        editor.setPlainText(content)
+        editor.setPlainText(redact_sensitive(content))
         layout.addWidget(editor, 1)
 
         path_label = QLabel(
@@ -3593,6 +3149,21 @@ class MainWindow(QMainWindow):
         self.sidebar.update_button.clicked.connect(self.check_updates)
         self.update_thread = None
         self.update_worker = None
+        self._pending_update_tag = None
+        self._pending_update_sha = None
+
+    def active_threads(self, *, include_update=True):
+        return [thread for thread in self.findChildren(QThread)
+                if thread.isRunning() and (include_update or thread is not self.update_thread)]
+
+    def closeEvent(self, event):
+        if self.active_threads():
+            event.ignore()
+            show_dialog(self, QMessageBox.Icon.Information, "Operation in progress",
+                        "Wait for the active operations to finish before closing SpiceConex.",
+                        "Closing the interface does not cancel commands already submitted to AWS.")
+            return
+        super().closeEvent(event)
 
     def show_terminal(self):
         self.stack.setCurrentIndex(1)
@@ -3603,7 +3174,7 @@ class MainWindow(QMainWindow):
             return
         self.sidebar.update_button.setEnabled(False)
         self.sidebar.update_button.setText("CHECKING…")
-        self.update_thread = QThread()
+        self.update_thread = QThread(self)
         self.update_worker = Worker(lambda: check_for_update(ROOT.parent))
         self.update_worker.moveToThread(self.update_thread)
         self.update_thread.started.connect(self.update_worker.run)
@@ -3637,9 +3208,13 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            launch_update_process(ROOT.parent, os.getpid(), info["tag"])
+            if self.active_threads(include_update=False):
+                show_dialog(self, QMessageBox.Icon.Information, "Operation in progress",
+                            "Wait for the active operations to finish before updating SpiceConex.")
+                return
             show_dialog(self, QMessageBox.Icon.Information, "Updating SpiceConex", "SpiceConex will close, update from GitHub and restart automatically.", "The independent updater refuses local changes, prepares dependencies before changing source files, then fast-forwards the Git branch.")
-            QApplication.instance().quit()
+            self._pending_update_tag = info["tag"]
+            self._pending_update_sha = info["remote_sha"]
         except Exception as exc:
             logger.exception("Update action failed | %s: %s", type(exc).__name__, exc)
             show_exception(self, "SpiceConex update", "applying the application update", exc, QMessageBox.Icon.Warning)
@@ -3658,20 +3233,20 @@ class MainWindow(QMainWindow):
         self.update_worker = None
         self.sidebar.update_button.setEnabled(True)
         self.sidebar.update_button.setText("CHECK FOR UPDATES")
+        tag = self._pending_update_tag
+        sha = self._pending_update_sha
+        self._pending_update_tag = None
+        self._pending_update_sha = None
+        if tag and not self.active_threads():
+            try:
+                launch_update_process(ROOT.parent, os.getpid(), tag, sha)
+                self.close()
+            except Exception as exc:
+                show_exception(self, "SpiceConex update", "starting the application update", exc)
 
 
-def main():
-    reset_logging_session()
-    logger.info("Application starting | log_file=%s", log_path())
-    parser=argparse.ArgumentParser(); parser.add_argument("--demo",action="store_true"); args=parser.parse_args()
-    app=QApplication([]); app.setStyle("Fusion"); app.setStyleSheet(STYLE); app.setFont(QFont("Segoe UI",10))
-    if LOGO_SIDEBAR.exists():
-        app.setWindowIcon(QIcon(str(LOGO_SIDEBAR))); window=MainWindow(args.demo); window.show()
-        update_error = ROOT.parent / "update-error.log"
-        if update_error.exists():
-            details = update_error.read_text(encoding="utf-8", errors="replace").strip()
-            update_error.unlink(missing_ok=True)
-            show_dialog(window, QMessageBox.Icon.Warning, "SpiceConex update failed", "SpiceConex has restarted normally. Review the details before trying the update again.", details)
-        app.exec()
+def main(argv=None):
+    from pyside6_poc.startup import run
+    return run(MainWindow, STYLE, LOGO_SIDEBAR, ROOT.parent, argv=argv)
 
-if __name__ == "__main__": main()
+if __name__ == "__main__": raise SystemExit(main())

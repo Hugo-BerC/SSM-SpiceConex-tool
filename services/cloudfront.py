@@ -6,9 +6,8 @@ from datetime import datetime
 from typing import Any
 
 import boto3
-from botocore.config import Config
 
-from app.config import AWS_TIMEOUT_SECONDS
+from aws.session import client_config as _client_config, get_boto3_session
 from utils.logging import get_logger
 
 
@@ -33,14 +32,6 @@ CLOUDFRONT_COLUMNS = [
 ]
 
 
-def _client_config() -> Config:
-    timeout = max(5, AWS_TIMEOUT_SECONDS)
-    return Config(
-        connect_timeout=min(5, timeout),
-        read_timeout=timeout,
-        retries={"mode": "standard", "max_attempts": 1},
-        tcp_keepalive=True,
-    )
 
 
 def _format_datetime(value: Any) -> str:
@@ -73,7 +64,7 @@ def discover_distributions(profile: str, region: str) -> dict:
     if not region:
         raise ValueError("No AWS region is selected in Terminal.")
 
-    session = boto3.Session(profile_name=profile, region_name=region)
+    session = get_boto3_session(profile, region)
     cloudfront = session.client("cloudfront", config=_client_config())
     distributions: list[dict] = []
     paginator = cloudfront.get_paginator("list_distributions")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import base64
 import platform
 import shutil
 import shlex
@@ -84,8 +85,15 @@ def find_terminal() -> str | None:
     return None
 
 
-def _powershell_quote(command: str) -> str:
-    return command.replace("'", "''")
+def _applescript_quote(value: str) -> str:
+    escaped = (value.replace("\\", "\\\\").replace('"', '\\"')
+               .replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t"))
+    return '"' + escaped + '"'
+
+
+def _wt_quote(value: str) -> str:
+    """Escape Windows Terminal's own command separator, independently of shells."""
+    return value.replace(";", "\\;")
 
 
 def _xterm_arguments(terminal: str, title: str, command: str) -> list[str]:
@@ -112,20 +120,28 @@ def open_command(command: str, title: str | None = None):
         # Terminal.app keeps the user's normal shell (zsh) and creates a new tab
         # directly through its AppleScript API, avoiding Accessibility permissions.
         script = (
-            'tell application "Terminal" to activate\n'
-            f'tell application "Terminal" to do script {command!r} in front window\n'
-            f'tell application "Terminal" to set custom title of selected tab of front window to {window_title!r}'
+            'tell application "Terminal"\n'
+            'activate\n'
+            'if (count of windows) is 0 then\n'
+            f'set sessionTab to do script {_applescript_quote(command)}\n'
+            'else\n'
+            f'set sessionTab to do script {_applescript_quote(command)} in front window\n'
+            'end if\n'
+            f'set custom title of sessionTab to {_applescript_quote(window_title)}\n'
+            'end tell'
         )
         return subprocess.Popen(["osascript", "-e", script])
 
     if system == "Windows":
+        encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
+        powershell_args = ["powershell.exe", "-NoExit", "-EncodedCommand", encoded]
         terminal = _windows_terminal_on_windows()
         if terminal:
-            return subprocess.Popen([terminal, "-w", "0", "new-tab", "--title", window_title, "powershell.exe", "-NoExit", command])
+            return subprocess.Popen([terminal, "-w", "0", "new-tab", "--title", _wt_quote(window_title), *powershell_args])
         terminal = shutil.which("powershell.exe")
         if not terminal:
             raise RuntimeError("No supported Windows terminal found.")
-        return subprocess.Popen([terminal, "-NoExit", command])
+        return subprocess.Popen([terminal, *powershell_args[1:]])
 
     if _is_wsl():
         wt = _windows_terminal_in_wsl()
@@ -133,10 +149,10 @@ def open_command(command: str, title: str | None = None):
         if wt:
             # -w 0 reuses the most recently used Windows Terminal window.
             # The AWS CLI and SSO cache remain inside the selected WSL distro.
-            args = [wt, "-w", "0", "new-tab", "--title", window_title, "wsl.exe"]
+            args = [wt, "-w", "0", "new-tab", "--title", _wt_quote(window_title), "wsl.exe"]
             if distro:
-                args += ["-d", distro]
-            args += ["--exec", "bash", "-lc", command]
+                args += ["-d", _wt_quote(distro)]
+            args += ["--exec", "bash", "-lc", _wt_quote(command)]
             try:
                 return subprocess.Popen(args)
             except OSError:

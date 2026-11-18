@@ -3,55 +3,21 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from botocore.config import Config
 
 from utils.logging import get_logger
 
-from aws.session import get_boto3_session
+from aws.session import get_boto3_session, client_config as _config
+from aws.auth import is_session_unavailable as _session_unavailable_error
+from aws.errors import classify_error, error_code
 from .aws_config import discover_config_inventory
 from .graph import add_relation
 from .models import InfrastructureGraph, ResourceNode
 
 DEFAULT_TAG_KEY = "ib:resource:application"
 SUPPORTED_TAG_KEYS = ("ib:resource:application", "ib:component:repo")
-AWS_TIMEOUT_SECONDS = 20
 logger = get_logger("discovery")
 
 
-def _session_unavailable_error(exc: Exception) -> bool:
-    """Return True for AWS credential/SSO failures that must escape discovery.
-
-    Discovery must not turn an authentication failure into an apparently
-    successful empty graph. The UI wrapper needs to see the exception so it
-    can perform `aws sso login` and retry with a fresh boto3 session.
-    """
-    text = str(exc).lower()
-    markers = (
-        "expiredtoken",
-        "expired token",
-        "unauthorizedsso",
-        "sso session",
-        "token has expired",
-        "unable to locate credentials",
-        "no credentials",
-        "credential should be refreshed",
-        "invalidclienttokenid",
-        "unrecognizedclientexception",
-        "the security token included in the request is invalid",
-        "security token is invalid",
-        "unable to refresh credentials",
-        "refresh failed",
-    )
-    return any(marker in text for marker in markers)
-
-
-def _config() -> Config:
-    return Config(
-        connect_timeout=min(5, AWS_TIMEOUT_SECONDS),
-        read_timeout=AWS_TIMEOUT_SECONDS,
-        retries={"mode": "standard", "max_attempts": 1},
-        tcp_keepalive=True,
-    )
 
 
 def _tags(items: Any, key_name: str = "Key", value_name: str = "Value") -> dict[str, str]:
@@ -68,10 +34,16 @@ def _tags(items: Any, key_name: str = "Key", value_name: str = "Value") -> dict[
     return result
 
 
-def _safe_tags(fn) -> dict[str, str]:
+def _safe_tags(fn, warnings=None) -> dict[str, str]:
     try:
         return _tags(fn())
-    except Exception:
+    except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
+        if warnings is not None:
+            # An untagged S3 bucket is a normal absence, not a partial read.
+            if error_code(exc) not in {"NoSuchTagSet", "NoSuchTagSetException"}:
+                warnings.append(f"Resource tags unavailable: {classify_error(exc)} ({error_code(exc)})")
         return {}
 
 
@@ -294,7 +266,7 @@ def _discover_region(session, graph, region, account_id, tag_key):
         for lb in _paginate(elb, "describe_load_balancers", "LoadBalancers"):
             lb_id = lb["LoadBalancerArn"]
             load_balancer_arns.append(lb_id)
-            tags = _safe_tags(lambda arn=lb_id: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []))
+            tags = _safe_tags(lambda arn=lb_id: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []), graph.warnings)
             lb_type = {
                 "application": "ALB",
                 "network": "NLB",
@@ -319,7 +291,7 @@ def _discover_region(session, graph, region, account_id, tag_key):
                 if len(associated_types) == 1 and next(iter(associated_types)) in {"ALB", "NLB", "GWLB"}
                 else "TargetGroup"
             )
-            tags = _safe_tags(lambda arn=arn: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []))
+            tags = _safe_tags(lambda arn=arn: elb.describe_tags(ResourceArns=[arn])["TagDescriptions"][0].get("Tags", []), graph.warnings)
             tg_by_arn[arn] = _add(
                 graph, arn, arn, target_group_type, tg.get("TargetGroupName", arn), region, account_id, tags,
                 Protocol=tg.get("Protocol", ""), Port=tg.get("Port"), TargetType=tg.get("TargetType", ""),
@@ -333,7 +305,9 @@ def _discover_region(session, graph, region, account_id, tag_key):
                     target_id = target.get("Target", {}).get("Id")
                     if target_id in instance_by_id:
                         add_relation(graph, arn, target_id, "targets")
-            except Exception:
+            except Exception as exc:
+                if _session_unavailable_error(exc):
+                    raise
                 pass
 
         # DescribeListeners does not support an account-wide paginator: AWS
@@ -362,6 +336,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
                     raise
                 graph.warnings.append(f"{region}: listener discovery incomplete for {lb_arn.rsplit('/', 1)[-1]}: {exc}")
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: ELB discovery incomplete: {exc}")
 
     # RDS
@@ -370,7 +346,7 @@ def _discover_region(session, graph, region, account_id, tag_key):
         for db in _paginate(rds, "describe_db_instances", "DBInstances"):
             arn = db.get("DBInstanceArn")
             db_id = arn or db.get("DBInstanceIdentifier")
-            tags = _safe_tags(lambda arn=arn: rds.list_tags_for_resource(ResourceName=arn).get("TagList", [])) if arn else {}
+            tags = _safe_tags(lambda arn=arn: rds.list_tags_for_resource(ResourceName=arn).get("TagList", []), graph.warnings) if arn else {}
             _add(graph, db_id, arn, "RDS", db.get("DBInstanceIdentifier", db_id), region, account_id, tags, Engine=db.get("Engine", ""), VpcId=db.get("DBSubnetGroup", {}).get("VpcId"), DBSubnetGroup=db.get("DBSubnetGroup", {}).get("DBSubnetGroupName", ""))
             for group in db.get("VpcSecurityGroups", []):
                 if group.get("VpcSecurityGroupId") in sg_by_id:
@@ -380,6 +356,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
                 if subnet_id in subnet_by_id:
                     add_relation(graph, db_id, subnet_id, "attached_to")
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: RDS discovery incomplete: {exc}")
 
     # Lambda functions with VPC configuration.
@@ -388,7 +366,7 @@ def _discover_region(session, graph, region, account_id, tag_key):
         for fn in _paginate(lam, "list_functions", "Functions"):
             name = fn.get("FunctionName", "")
             arn = fn.get("FunctionArn")
-            tags = _safe_tags(lambda arn=arn: lam.list_tags(Resource=arn).get("Tags", {}))
+            tags = _safe_tags(lambda arn=arn: lam.list_tags(Resource=arn).get("Tags", {}), graph.warnings)
             cfg = fn.get("VpcConfig", {})
             resource_id = arn or name
             node = _add(graph, resource_id, arn, "Lambda", name, region, account_id, tags,
@@ -397,6 +375,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
             if vpc_id:
                 node.metadata["VpcId"] = vpc_id
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: Lambda discovery incomplete: {exc}")
 
     # API Gateway metrics use an API name for REST APIs and an API ID for the
@@ -448,6 +428,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
                 if instance_id in instance_by_id:
                     add_relation(graph, node.id, instance_id, "contains")
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: Auto Scaling discovery incomplete: {exc}")
 
     # EFS file systems are regional, but their mount targets are VPC/subnet
@@ -484,6 +466,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
                 node.metadata["VpcId"] = next(iter(vpc_ids))
                 add_relation(graph, node.metadata["VpcId"], filesystem_id, "contains")
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: EFS discovery incomplete: {exc}")
 
     # ECS services in awsvpc mode have a direct subnet/security-group
@@ -519,6 +503,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
                     if target_group in tg_by_arn:
                         add_relation(graph, service_id, target_group, "uses")
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: ECS discovery incomplete: {exc}")
 
     # EKS clusters and managed node groups expose their VPC configuration
@@ -556,6 +542,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
                     if asg_id in graph.nodes:
                         add_relation(graph, nodegroup_id, asg_id, "contains")
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: EKS discovery incomplete: {exc}")
 
     try:
@@ -569,7 +557,7 @@ def _discover_region(session, graph, region, account_id, tag_key):
             if not cluster_name:
                 continue
             arn = cluster.get("ARN")
-            tags = _safe_tags(lambda arn=arn: cache.list_tags_for_resource(ResourceName=arn).get("TagList", [])) if arn else {}
+            tags = _safe_tags(lambda arn=arn: cache.list_tags_for_resource(ResourceName=arn).get("TagList", []), graph.warnings) if arn else {}
             node = _add(
                 graph, f"elasticache:{cluster_name}", arn, "ElastiCache", cluster_name, region, account_id, tags,
                 Engine=cluster.get("Engine", ""), Status=cluster.get("CacheClusterStatus", ""),
@@ -581,6 +569,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
             if vpc_id:
                 node.metadata["VpcId"] = vpc_id
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: ElastiCache discovery incomplete: {exc}")
 
     try:
@@ -588,10 +578,12 @@ def _discover_region(session, graph, region, account_id, tag_key):
         for table_name in _paginate(dynamodb, "list_tables", "TableNames"):
             table = dynamodb.describe_table(TableName=table_name).get("Table", {})
             arn = table.get("TableArn")
-            tags = _safe_tags(lambda arn=arn: dynamodb.list_tags_of_resource(ResourceArn=arn).get("Tags", [])) if arn else {}
+            tags = _safe_tags(lambda arn=arn: dynamodb.list_tags_of_resource(ResourceArn=arn).get("Tags", []), graph.warnings) if arn else {}
             _add(graph, arn or f"dynamodb:{table_name}", arn, "DynamoDB", table_name, region, account_id, tags,
                  Status=table.get("TableStatus", ""), BillingMode=table.get("BillingModeSummary", {}).get("BillingMode", ""))
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: DynamoDB discovery incomplete: {exc}")
 
     try:
@@ -610,6 +602,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
             if vpc_id:
                 node.metadata["VpcId"] = vpc_id
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: FSx discovery incomplete: {exc}")
 
     # Interface and gateway endpoints are key to explaining private AWS traffic.
@@ -624,6 +618,8 @@ def _discover_region(session, graph, region, account_id, tag_key):
             )
             _attach_network(graph, node.id, endpoint.get("SubnetIds", []), endpoint.get("Groups", []), endpoint.get("VpcId", ""))
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"{region}: VPC endpoint discovery incomplete: {exc}")
 
 
@@ -635,9 +631,11 @@ def _discover_global(session, graph, account_id, tag_key):
     try:
         for bucket in s3.list_buckets().get("Buckets", []):
             name = bucket.get("Name", "")
-            tags = _safe_tags(lambda name=name: s3.get_bucket_tagging(Bucket=name).get("TagSet", []))
+            tags = _safe_tags(lambda name=name: s3.get_bucket_tagging(Bucket=name).get("TagSet", []), graph.warnings)
             _add(graph, f"s3://{name}", f"arn:aws:s3:::{name}", "S3", name, "global", account_id, tags, CreationDate=str(bucket.get("CreationDate", "")))
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"S3 discovery incomplete: {exc}")
 
     route53 = session.client("route53", config=_config())
@@ -646,7 +644,9 @@ def _discover_global(session, graph, account_id, tag_key):
             zone_id = zone.get("Id", "").split("/")[-1]
             resource_id = f"route53:{zone_id}"
             arn = f"arn:aws:route53:::hostedzone/{zone_id}"
-            tags = _safe_tags(lambda arn=arn: route53.list_tags_for_resource(ResourceType="hostedzone", ResourceId=zone_id).get("ResourceTagSet", {}).get("Tags", []))
+            tags = _safe_tags(lambda arn=arn: route53.list_tags_for_resource(ResourceType="hostedzone", ResourceId=zone_id).get("ResourceTagSet", {}).get("Tags", []), graph.warnings)
             _add(graph, resource_id, arn, "Route53HostedZone", zone.get("Name", zone_id), "global", account_id, tags, PrivateZone=zone.get("Config", {}).get("PrivateZone", False))
     except Exception as exc:
+        if _session_unavailable_error(exc):
+            raise
         graph.warnings.append(f"Route53 discovery incomplete: {exc}")

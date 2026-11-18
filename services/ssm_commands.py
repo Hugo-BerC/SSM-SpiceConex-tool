@@ -5,16 +5,32 @@ import shlex
 import subprocess
 
 
+def _powershell_literal(value: str) -> str:
+    # PowerShell also treats typographic single quotes as delimiters.
+    for quote in ("'", "\u2018", "\u2019", "\u201a", "\u201b"):
+        value = value.replace(quote, quote * 2)
+    return "'" + value + "'"
+
+
 def shell_quote(value: str) -> str:
-    """Quote a value for the shell used by the external terminal."""
+    """Quote a native argument for POSIX shells or Windows PowerShell 5.1."""
     if platform.system() == "Windows":
-        return subprocess.list2cmdline([value])
+        # PowerShell's literal protects against expansion; the inner Windows
+        # argv quoting preserves embedded quotes when powershell.exe invokes
+        # a native program using its legacy argument passing rules.
+        return _powershell_literal(subprocess.list2cmdline([value]))
+    return shlex.quote(value)
+
+
+def _executable(value: str) -> str:
+    if platform.system() == "Windows":
+        return "& " + _powershell_literal(value)
     return shlex.quote(value)
 
 
 def build_start_session_command(aws_path: str, instance_id: str, profile: str, region: str) -> str:
     return " ".join([
-        shell_quote(aws_path),
+        _executable(aws_path),
         "ssm", "start-session",
         "--target", shell_quote(instance_id),
         "--profile", shell_quote(profile),
@@ -40,7 +56,7 @@ def build_port_forward_command(
     remote_port: int,
 ) -> str:
     return " ".join([
-        shell_quote(aws_path),
+        _executable(aws_path),
         "ssm", "start-session",
         "--target", shell_quote(instance_id),
         "--profile", shell_quote(profile),

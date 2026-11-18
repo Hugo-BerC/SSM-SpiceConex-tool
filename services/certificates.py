@@ -4,9 +4,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 import boto3
-from botocore.config import Config
 
-from app.config import AWS_TIMEOUT_SECONDS
+from aws.session import client_config as _client_config, get_boto3_session
+from aws.auth import is_session_unavailable
+from aws.errors import classify_error, error_code
 from utils.logging import get_logger
 
 logger = get_logger("services.certificates")
@@ -20,6 +21,8 @@ CERTIFICATE_STATUSES = (
     "REVOKED",
     "FAILED",
 )
+CERTIFICATE_KEY_TYPES = ("RSA_1024", "RSA_2048", "RSA_3072", "RSA_4096",
+                         "EC_prime256v1", "EC_secp384r1", "EC_secp521r1")
 TLS_PROTOCOLS = {"HTTPS", "TLS"}
 LOAD_BALANCER_TYPES = {"application", "network"}
 
@@ -58,14 +61,6 @@ BALANCER_COLUMNS = [
 ]
 
 
-def _client_config() -> Config:
-    timeout = max(5, AWS_TIMEOUT_SECONDS)
-    return Config(
-        connect_timeout=min(5, timeout),
-        read_timeout=timeout,
-        retries={"mode": "standard", "max_attempts": 1},
-        tcp_keepalive=True,
-    )
 
 
 def _format_datetime(value: Any) -> str:
@@ -186,7 +181,7 @@ def discover_certificate_inventory(profile: str, region: str) -> dict:
     if not region:
         raise ValueError("No AWS region is selected in Terminal.")
 
-    session = boto3.Session(profile_name=profile, region_name=region)
+    session = get_boto3_session(profile, region)
     sts = session.client("sts", config=_client_config())
     identity = sts.get_caller_identity()
     account_id = identity.get("Account", "")
@@ -194,121 +189,141 @@ def discover_certificate_inventory(profile: str, region: str) -> dict:
     acm = session.client("acm", region_name=region, config=_client_config())
     certificates: list[dict] = []
     certificate_by_arn: dict[str, dict] = {}
+    warnings = []
 
     paginator = acm.get_paginator("list_certificates")
-    for page in paginator.paginate(CertificateStatuses=list(CERTIFICATE_STATUSES)):
-        for summary in page.get("CertificateSummaryList", []):
-            arn = summary.get("CertificateArn")
-            if not arn:
-                continue
-            try:
-                detail = acm.describe_certificate(CertificateArn=arn)["Certificate"]
-            except Exception as exc:
-                logger.warning("Unable to describe certificate %s: %s", arn, exc)
-                continue
+    try:
+        for page in paginator.paginate(CertificateStatuses=list(CERTIFICATE_STATUSES),
+                                      Includes={"keyTypes": list(CERTIFICATE_KEY_TYPES)}):
+            for summary in page.get("CertificateSummaryList", []):
+                arn = summary.get("CertificateArn")
+                if not arn:
+                    continue
+                try:
+                    detail = acm.describe_certificate(CertificateArn=arn)["Certificate"]
+                except Exception as exc:
+                    if is_session_unavailable(exc):
+                        raise
+                    logger.warning("Unable to describe certificate %s: %s", arn, exc)
+                    warnings.append(f"Certificate details unavailable: {classify_error(exc)} ({error_code(exc)})")
+                    continue
 
-            names = detail.get("SubjectAlternativeNames", [])
-            in_use_by = detail.get("InUseBy", [])
-            row = {
-                "Account": profile,
-                "AccountId": account_id,
-                "Region": region,
-                "Domain": detail.get("DomainName", ""),
-                "SANs": " | ".join(names),
-                "Status": detail.get("Status", ""),
-                "NotAfter": _format_datetime(detail.get("NotAfter")),
-                "Expiry": expiry_bucket(detail.get("NotAfter")),
-                "Type": detail.get("Type", ""),
-                "CertificateScope": certificate_scope(detail.get("Type", "")),
-                "InUse": bool(in_use_by),
-                "Resources": " | ".join(in_use_by),
-                "ResourceCount": len(in_use_by),
-                "CertificateArn": arn,
-                "InUseByList": in_use_by,
-                "SubjectAlternativeNames": names,
-                "NotAfterValue": detail.get("NotAfter"),
-            }
-            certificates.append(row)
-            certificate_by_arn[arn] = row
+                names = detail.get("SubjectAlternativeNames", [])
+                in_use_by = detail.get("InUseBy", [])
+                row = {
+                    "Account": profile,
+                    "AccountId": account_id,
+                    "Region": region,
+                    "Domain": detail.get("DomainName", ""),
+                    "SANs": " | ".join(names),
+                    "Status": detail.get("Status", ""),
+                    "NotAfter": _format_datetime(detail.get("NotAfter")),
+                    "Expiry": expiry_bucket(detail.get("NotAfter")),
+                    "Type": detail.get("Type", ""),
+                    "CertificateScope": certificate_scope(detail.get("Type", "")),
+                    "InUse": bool(in_use_by),
+                    "Resources": " | ".join(in_use_by),
+                    "ResourceCount": len(in_use_by),
+                    "CertificateArn": arn,
+                    "InUseByList": in_use_by,
+                    "SubjectAlternativeNames": names,
+                    "NotAfterValue": detail.get("NotAfter"),
+                }
+                certificates.append(row)
+                certificate_by_arn[arn] = row
+
+    except Exception as exc:
+        if is_session_unavailable(exc):
+            raise
+        warnings.append(f"ACM inventory incomplete: {classify_error(exc)} ({error_code(exc)})")
 
     balancers: list[dict] = []
     elbv2 = session.client("elbv2", region_name=region, config=_client_config())
     lb_paginator = elbv2.get_paginator("describe_load_balancers")
 
-    for page in lb_paginator.paginate():
-        for load_balancer in page.get("LoadBalancers", []):
-            lb_type = load_balancer.get("Type", "")
-            if lb_type not in LOAD_BALANCER_TYPES:
-                continue
-            try:
-                listeners = []
-                listener_paginator = elbv2.get_paginator("describe_listeners")
-                for listener_page in listener_paginator.paginate(
-                    LoadBalancerArn=load_balancer["LoadBalancerArn"]
-                ):
-                    listeners.extend(listener_page.get("Listeners", []))
-            except Exception as exc:
-                logger.warning(
-                    "Unable to list listeners for %s: %s",
-                    load_balancer.get("LoadBalancerName", ""),
-                    exc,
-                )
-                continue
-
-            for listener in listeners:
-                protocol = listener.get("Protocol", "")
-                if protocol not in TLS_PROTOCOLS:
+    try:
+        for page in lb_paginator.paginate():
+            for load_balancer in page.get("LoadBalancers", []):
+                lb_type = load_balancer.get("Type", "")
+                if lb_type not in LOAD_BALANCER_TYPES:
                     continue
-                cert_arns = [
-                    arn for arn in _listener_certificates(elbv2, listener)
-                    if arn in certificate_by_arn
-                ]
-                if not cert_arns:
+                try:
+                    listeners = []
+                    listener_paginator = elbv2.get_paginator("describe_listeners")
+                    for listener_page in listener_paginator.paginate(
+                        LoadBalancerArn=load_balancer["LoadBalancerArn"]
+                    ):
+                        listeners.extend(listener_page.get("Listeners", []))
+                except Exception as exc:
+                    if is_session_unavailable(exc):
+                        raise
+                    warnings.append(f"Listener inventory incomplete: {classify_error(exc)} ({error_code(exc)})")
+                    logger.warning(
+                        "Unable to list listeners for %s: %s",
+                        load_balancer.get("LoadBalancerName", ""),
+                        exc,
+                    )
                     continue
 
-                rules = _listener_rules(elbv2, listener["ListenerArn"]) if lb_type == "application" else []
-                for cert_arn in cert_arns:
-                    certificate = certificate_by_arn[cert_arn]
-                    matching_rows = []
-                    no_host_rules = []
-                    for rule in rules:
-                        hosts = rule["HostHeaders"]
-                        if not hosts:
-                            no_host_rules.append(rule)
-                            continue
-                        matched_hosts = [
-                            host for host in hosts
-                            if certificate_matches_host(certificate, host)
-                        ]
-                        if matched_hosts:
-                            matching_rows.append((rule, matched_hosts))
+                for listener in listeners:
+                    protocol = listener.get("Protocol", "")
+                    if protocol not in TLS_PROTOCOLS:
+                        continue
+                    cert_arns = [
+                        arn for arn in _listener_certificates(elbv2, listener)
+                        if arn in certificate_by_arn
+                    ]
+                    if not cert_arns:
+                        continue
 
-                    if matching_rows:
-                        for rule, matched_hosts in matching_rows:
+                    rules = _listener_rules(elbv2, listener["ListenerArn"]) if lb_type == "application" else []
+                    for cert_arn in cert_arns:
+                        certificate = certificate_by_arn[cert_arn]
+                        matching_rows = []
+                        no_host_rules = []
+                        for rule in rules:
+                            hosts = rule["HostHeaders"]
+                            if not hosts:
+                                no_host_rules.append(rule)
+                                continue
+                            matched_hosts = [
+                                host for host in hosts
+                                if certificate_matches_host(certificate, host)
+                            ]
+                            if matched_hosts:
+                                matching_rows.append((rule, matched_hosts))
+
+                        if matching_rows:
+                            for rule, matched_hosts in matching_rows:
+                                balancers.append(
+                                    _build_balancer_row(
+                                        profile, account_id, region, load_balancer,
+                                        listener, certificate, cert_arn, rule,
+                                        "MATCH", matched_hosts,
+                                    )
+                                )
+                        elif no_host_rules:
+                            balancers.append(
+                                _build_balancer_row(
+                                    profile, account_id, region, load_balancer,
+                                    listener, certificate, cert_arn, no_host_rules[0],
+                                    "LISTENER", [],
+                                )
+                            )
+                        else:
+                            rule = rules[0] if rules else _empty_rule()
                             balancers.append(
                                 _build_balancer_row(
                                     profile, account_id, region, load_balancer,
                                     listener, certificate, cert_arn, rule,
-                                    "MATCH", matched_hosts,
+                                    "MISMATCH" if lb_type == "application" else "LISTENER", [],
                                 )
                             )
-                    elif no_host_rules:
-                        balancers.append(
-                            _build_balancer_row(
-                                profile, account_id, region, load_balancer,
-                                listener, certificate, cert_arn, no_host_rules[0],
-                                "LISTENER", [],
-                            )
-                        )
-                    else:
-                        rule = rules[0] if rules else _empty_rule()
-                        balancers.append(
-                            _build_balancer_row(
-                                profile, account_id, region, load_balancer,
-                                listener, certificate, cert_arn, rule,
-                                "MISMATCH" if lb_type == "application" else "LISTENER", [],
-                            )
-                        )
+
+    except Exception as exc:
+        if is_session_unavailable(exc):
+            raise
+        warnings.append(f"ELB inventory incomplete: {classify_error(exc)} ({error_code(exc)})")
 
     for certificate in certificates:
         resource_rows = [
@@ -332,6 +347,8 @@ def discover_certificate_inventory(profile: str, region: str) -> dict:
         "region": region,
         "certificates": certificates,
         "balancers": balancers,
+        "warnings": warnings,
+        "complete": not warnings,
     }
 
 

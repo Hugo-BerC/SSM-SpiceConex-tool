@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
+from aws.auth import is_session_unavailable
 
 from .graph import add_relation
 from .models import InfrastructureGraph, ResourceNode
@@ -162,8 +164,9 @@ def _relation_name(value: Any) -> str:
 
 
 def _query_all_current_resources(client) -> list[dict[str, Any]]:
-    """Fallback for accounts that can query Config but not list its inventory."""
-    expression = "SELECT resourceType, resourceId, resourceName, arn, awsRegion, accountId"
+    """Read queryable resources, explicitly selecting non-scalar CI fields."""
+    expression = ("SELECT resourceType, resourceId, resourceName, arn, awsRegion, accountId, "
+                  "configuration, tags, relationships")
     result: list[dict[str, Any]] = []
     next_token = None
     while True:
@@ -228,25 +231,33 @@ def _recorded_resources(client) -> list[dict[str, Any]]:
     return resources
 
 
-def _enrich_configuration_items(client, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _enrich_configuration_items(client, items: list[dict[str, Any]], warnings: list[str] | None = None) -> list[dict[str, Any]]:
     """Read detailed current configuration items in AWS Config's batch size."""
     enriched: dict[tuple[str, str], dict[str, Any]] = {}
+    warnings = warnings if warnings is not None else []
     for start in range(0, len(items), 100):
-        keys = []
-        for item in items[start:start + 100]:
-            key = {"resourceType": item["resourceType"], "resourceId": item["resourceId"]}
-            if item.get("resourceName"):
-                key["resourceName"] = item["resourceName"]
-            keys.append(key)
-        try:
-            response = client.batch_get_resource_config(resourceKeys=keys)
-        except Exception:
-            # The basic advanced-query result is still a useful inventory if a
-            # particular resource family cannot be read through the batch API.
-            continue
-        for item in response.get("baseConfigurationItems", []):
-            if isinstance(item, dict):
-                enriched[(str(item.get("resourceType", "")), str(item.get("resourceId", "")))] = item
+        keys = [{"resourceType": item["resourceType"], "resourceId": item["resourceId"]}
+                for item in items[start:start + 100]]
+        pending = keys
+        for attempt in range(3):
+            try:
+                response = client.batch_get_resource_config(resourceKeys=pending)
+            except Exception as exc:
+                if is_session_unavailable(exc):
+                    raise
+                warnings.append(f"AWS Config batch details unavailable: {exc}")
+                break
+            for item in response.get("baseConfigurationItems", []):
+                if isinstance(item, dict):
+                    enriched[(str(item.get("resourceType", "")), str(item.get("resourceId", "")))] = item
+            pending = response.get("unprocessedResourceKeys", [])
+            if not pending:
+                break
+            if attempt < 2:
+                time.sleep(0.2 * 2 ** attempt)
+        missing = sum((key["resourceType"], key["resourceId"]) not in enriched for key in keys)
+        if missing:
+            warnings.append(f"AWS Config current details missing for {missing} resource(s) in a batch.")
     return [
         {**item, **enriched.get((str(item.get("resourceType", "")), str(item.get("resourceId", ""))), {})}
         for item in items
@@ -265,24 +276,48 @@ def discover_config_inventory(session, graph: InfrastructureGraph, region: str, 
         recorders = client.describe_configuration_recorders().get("ConfigurationRecorders", [])
         statuses = client.describe_configuration_recorder_status().get("ConfigurationRecordersStatus", [])
     except Exception as exc:
+        if is_session_unavailable(exc):
+            raise
         return ConfigSnapshotStatus(False, False, detail=f"AWS Config unavailable: {exc}")
 
     active = bool(recorders) and any(item.get("recording") for item in statuses)
     if not active:
         return ConfigSnapshotStatus(True, False, detail="AWS Config recorder is not active; using live AWS service discovery.")
 
+    warnings: list[str] = []
+    query_items = None
     try:
         items = _recorded_resources(client)
     except Exception as inventory_exc:
+        if is_session_unavailable(inventory_exc):
+            raise
         # Older or tightly scoped Config policies can permit Advanced Query but
         # deny the inventory API. Keep a visibly partial fallback rather than
         # discarding useful configuration data altogether.
         try:
-            items = _query_all_current_resources(client)
+            items = query_items = _query_all_current_resources(client)
+            warnings.append(f"AWS Config inventory uses the queryable-resource fallback: {inventory_exc}")
         except Exception as query_exc:
+            if is_session_unavailable(query_exc):
+                raise
             return ConfigSnapshotStatus(True, True, detail=f"AWS Config inventory unavailable: {inventory_exc}; query fallback unavailable: {query_exc}")
 
-    items = _enrich_configuration_items(client, items)
+    items = _enrich_configuration_items(client, items, warnings)
+    # BatchGetResourceConfig deliberately excludes tags and does not expose
+    # relationships. Advanced Query supplements the broad recorded inventory;
+    # it must never replace it because some recorded types are not queryable.
+    if query_items is None:
+        try:
+            query_items = _query_all_current_resources(client)
+        except Exception as exc:
+            if is_session_unavailable(exc):
+                raise
+            query_items = []
+            warnings.append(f"AWS Config tags/relationships unavailable from Advanced Query: {exc}")
+    query_by_key = {(str(item.get("resourceType", "")), str(item.get("resourceId", ""))): item
+                    for item in query_items}
+    items = [{**query_by_key.get((str(item.get("resourceType", "")), str(item.get("resourceId", ""))), {}),
+              **item} for item in items]
     indexed: dict[tuple[str, str], str] = {}
     accepted: list[tuple[dict[str, Any], dict[str, Any], str]] = []
     for item in items:
@@ -316,5 +351,6 @@ def discover_config_inventory(session, graph: InfrastructureGraph, region: str, 
                     graph, source_id, target_id, _relation_name(relationship.get("relationshipName")),
                     confidence="AWS_CONFIG", discovery_source="AWS Config",
                 )
-    detail = "" if len(items) == len(accepted) else "AWS Config returned resources outside the selected region."
-    return ConfigSnapshotStatus(True, True, resources=len(accepted), detail=detail)
+    if len(items) != len(accepted):
+        warnings.append("AWS Config returned resources outside the selected region or with invalid identifiers.")
+    return ConfigSnapshotStatus(True, True, resources=len(accepted), detail="; ".join(warnings))

@@ -4,20 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssm-spiceconex"
-dynamic = ["version"]
+dynamic = ["version", "dependencies"]
 description = "AWS desktop utility for cloud engineers"
 requires-python = ">=3.10"
-dependencies = [
-  "PySide6>=6.8,<7",
-  "boto3>=1.39.0",
-  "botocore>=1.39.0",
-  "matplotlib>=3.10.0",
-  "numpy>=2.0.0",
-  "pandas>=2.2.0",
-  "Pillow>=11.3.0",
-  "packaging>=25.0",
-]
+
+[project.scripts]
+spiceconex = "pyside6_poc.main:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "app.version.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["app*", "aws*", "models*", "services*", "terminal*", "utils*", "pyside6_poc*"]
+exclude = ["tests*", "tools*"]
+
+[tool.setuptools.package-data]
+pyside6_poc = ["*.png"]
 
